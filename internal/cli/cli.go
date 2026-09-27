@@ -16,6 +16,8 @@ const Help = `命令：
   list                    查询全部设备
   get <编号>              查询单个设备
   update <编号> <新名称>  修改设备名称
+  enable <编号>           启用设备
+  disable <编号>          禁用设备
   delete <编号>           删除设备
   help                    显示帮助
   quit                    退出（内存数据会丢失）`
@@ -97,6 +99,22 @@ func (c *CLI) Execute(ctx context.Context, line string) (bool, error) {
 			return false, fmt.Errorf("用法: update <编号> <新名称>")
 		}
 		if err := c.service.Update(ctx, id, rest); err != nil {
+			return false, err
+		}
+
+	case "enable":
+		if id == "" || rest != "" {
+			return false, fmt.Errorf("用法: enable <编号>")
+		}
+		if err := c.service.Enable(ctx, id); err != nil {
+			return false, err
+		}
+
+	case "disable":
+		if id == "" || rest != "" {
+			return false, fmt.Errorf("用法: disable <编号>")
+		}
+		if err := c.service.Disable(ctx, id); err != nil {
 			return false, err
 		}
 

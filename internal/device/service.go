@@ -4,37 +4,69 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 )
 
 type Service struct {
 	repo Repository
+	now  func() time.Time // Service层实现对传入信息的时间校验
 }
 
 // 目前的一切操作都在对虚拟的接口进行操作，上层只需要接管接口，而不去在意接口是由什么功能实现
 func NewService(repo Repository) *Service {
-	return &Service{repo: repo}
+	return newServiceWithClock(repo, time.Now)
+}
+
+func newServiceWithClock(repo Repository, now func() time.Time) *Service {
+	return &Service{
+		repo: repo,
+		now:  now,
+	}
+}
+
+func (s *Service) currentTime() time.Time {
+	return s.now().UTC()
+}
+
+// 复用id与name的校验
+func validateID(id string) error {
+	if id == "" {
+		return fmt.Errorf("设备编号不能为空")
+	}
+	if len(id) > 64 {
+		return fmt.Errorf("设备编号不能超过 64 字节")
+	}
+	return nil
+}
+
+func validateName(name string) error {
+	if name == "" {
+		return fmt.Errorf("设备名称不能为空")
+	}
+	if len(name) > 128 {
+		return fmt.Errorf("设备名称不能超过 128 字节")
+	}
+	return nil
 }
 
 func (s *Service) Create(ctx context.Context, id, name string) error {
 	id = strings.TrimSpace(id)
 	name = strings.TrimSpace(name)
 
-	if id == "" {
-		return fmt.Errorf("设备编号不能为空")
+	if err := validateID(id); err != nil {
+		return err
 	}
-	if len(id) > 64 {
-		return fmt.Errorf("设备编号不能超出64字节")
-	}
-	if name == "" {
-		return fmt.Errorf("设备名称不能为空")
-	}
-	if len(name) > 128 {
-		return fmt.Errorf("设备名称不能超过128字节")
+	if err := validateName(name); err != nil {
+		return err
 	}
 
+	now := s.currentTime()
 	d := Device{
-		ID:   id,
-		Name: name,
+		ID:        id,
+		Name:      name,
+		Enabled:   true,
+		CreatedAt: now,
+		UpdatedAt: now,
 	}
 
 	if err := s.repo.Create(ctx, d); err != nil {
@@ -72,29 +104,55 @@ func (s *Service) Update(ctx context.Context, id, name string) error {
 	id = strings.TrimSpace(id)
 	name = strings.TrimSpace(name)
 
-	if id == "" {
-		return fmt.Errorf("设备编号不能为空")
+	if err := validateID(id); err != nil {
+		return err
 	}
-	if len(id) > 64 {
-		return fmt.Errorf("设备编号不能超过 64 字节")
-	}
-	if name == "" {
-		return fmt.Errorf("设备名称不能为空")
-	}
-	if len(name) > 128 {
-		return fmt.Errorf("设备名称不能超过 128 字节")
+	if err := validateName(name); err != nil {
+		return err
 	}
 
-	d := Device{
-		ID:   id,
-		Name: name,
+	d, err := s.repo.Get(ctx, id)
+	if err != nil {
+		return fmt.Errorf("修改设备 %q 失败: %w", id, err)
 	}
+
+	d.Name = name
+	d.UpdatedAt = s.currentTime()
 
 	if err := s.repo.Update(ctx, d); err != nil {
 		return fmt.Errorf("修改设备 %q 失败: %w", id, err)
 	}
-
 	return nil
+}
+
+// 增加设备启用与关闭选项
+func (s *Service) setEnabled(ctx context.Context, id string, enabled bool) error {
+	id = strings.TrimSpace(id)
+
+	if err := validateID(id); err != nil {
+		return err
+	}
+
+	d, err := s.repo.Get(ctx, id)
+	if err != nil {
+		return fmt.Errorf("修改设备启用状态 %q 失败: %w", id, err)
+	}
+
+	d.Enabled = enabled
+	d.UpdatedAt = s.currentTime()
+
+	if err := s.repo.Update(ctx, d); err != nil {
+		return fmt.Errorf("修改设备启用状态 %q 失败: %w", id, err)
+	}
+	return nil
+}
+
+func (s *Service) Enable(ctx context.Context, id string) error {
+	return s.setEnabled(ctx, id, true)
+}
+
+func (s *Service) Disable(ctx context.Context, id string) error {
+	return s.setEnabled(ctx, id, false)
 }
 
 func (s *Service) Delete(ctx context.Context, id string) error {
