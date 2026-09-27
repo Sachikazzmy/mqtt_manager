@@ -4,6 +4,7 @@ import (
 	"context"
 	"sort"
 	"sync"
+	"time"
 )
 
 type MemoryRepository struct {
@@ -75,22 +76,51 @@ func (r *MemoryRepository) List(
 	return devices, nil
 }
 
-func (r *MemoryRepository) Update(
-	ctx context.Context,
-	d Device,
-) error {
+func (r *MemoryRepository) UpdateName(ctx context.Context, id, name string, updatedAt time.Time) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
-	if _, exists := r.devices[d.ID]; !exists {
+	d, exists := r.devices[id]
+	if !exists {
 		return ErrNotFound
 	}
 
-	r.devices[d.ID] = d
+	d.Name = name
+	if updatedAt.After(d.UpdatedAt) {
+		d.UpdatedAt = updatedAt
+	}
+	r.devices[id] = d
+	return nil
+}
+
+func (r *MemoryRepository) SetEnabled(ctx context.Context, id string, enabled bool, updatedAt time.Time) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	d, exists := r.devices[id]
+	if !exists {
+		return ErrNotFound
+	}
+
+	d.Enabled = enabled
+	if updatedAt.After(d.UpdatedAt) {
+		d.UpdatedAt = updatedAt
+	}
+	r.devices[id] = d
 	return nil
 }
 

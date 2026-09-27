@@ -111,15 +111,7 @@ func (s *Service) Update(ctx context.Context, id, name string) error {
 		return err
 	}
 
-	d, err := s.repo.Get(ctx, id)
-	if err != nil {
-		return fmt.Errorf("修改设备 %q 失败: %w", id, err)
-	}
-
-	d.Name = name
-	d.UpdatedAt = s.currentTime()
-
-	if err := s.repo.Update(ctx, d); err != nil {
+	if err := s.repo.UpdateName(ctx, id, name, s.currentTime()); err != nil {
 		return fmt.Errorf("修改设备 %q 失败: %w", id, err)
 	}
 	return nil
@@ -133,15 +125,7 @@ func (s *Service) setEnabled(ctx context.Context, id string, enabled bool) error
 		return err
 	}
 
-	d, err := s.repo.Get(ctx, id)
-	if err != nil {
-		return fmt.Errorf("修改设备启用状态 %q 失败: %w", id, err)
-	}
-
-	d.Enabled = enabled
-	d.UpdatedAt = s.currentTime()
-
-	if err := s.repo.Update(ctx, d); err != nil {
+	if err := s.repo.SetEnabled(ctx, id, enabled, s.currentTime()); err != nil {
 		return fmt.Errorf("修改设备启用状态 %q 失败: %w", id, err)
 	}
 	return nil
