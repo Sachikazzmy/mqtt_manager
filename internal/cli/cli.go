@@ -6,9 +6,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
+	"strconv"
 	"strings"
+	"time"
 
 	"Project/internal/device"
+	"Project/internal/telemetry"
 )
 
 const Help = `命令：
@@ -19,18 +23,25 @@ const Help = `命令：
   enable <编号>           启用设备
   disable <编号>          禁用设备
   delete <编号>           删除设备
+  reset-secret <编号>     重置设备密钥（旧密钥立即失效）
+  receive <编号> <文件>   从本地 JSON 文件模拟上报
+  history <编号> <数量> [起始时间] [结束时间]
   help                    显示帮助
   quit                    退出（内存数据会丢失）`
 
 type CLI struct {
-	service *device.Service
-	out     io.Writer
+	devices      *device.Service
+	telemetry    *telemetry.Service
+	secretReader SecretReader
+	out          io.Writer
 }
 
-func New(service *device.Service, out io.Writer) *CLI {
+func New(devices *device.Service, telemetryService *telemetry.Service, out io.Writer, secretReader SecretReader) *CLI {
 	return &CLI{
-		service: service,
-		out:     out,
+		devices:      devices,
+		telemetry:    telemetryService,
+		secretReader: secretReader,
+		out:          out,
 	}
 }
 
@@ -70,15 +81,18 @@ func (c *CLI) Execute(ctx context.Context, line string) (bool, error) {
 		if id == "" || rest == "" {
 			return false, fmt.Errorf("用法: add <编号> <名称>")
 		}
-		if err := c.service.Create(ctx, id, rest); err != nil {
+		secret, err := c.devices.Create(ctx, id, rest)
+		if err != nil {
 			return false, err
 		}
+		_, err = fmt.Fprintf(c.out, "OK\n密钥（仅显示一次）: %s\n", secret)
+		return false, err
 
 	case "list":
 		if args != "" {
 			return false, fmt.Errorf("用法: list")
 		}
-		devices, err := c.service.List(ctx)
+		devices, err := c.devices.List(ctx)
 		if err != nil {
 			return false, err
 		}
@@ -88,7 +102,7 @@ func (c *CLI) Execute(ctx context.Context, line string) (bool, error) {
 		if id == "" || rest != "" {
 			return false, fmt.Errorf("用法: get <编号>")
 		}
-		d, err := c.service.Get(ctx, id)
+		d, err := c.devices.Get(ctx, id)
 		if err != nil {
 			return false, err
 		}
@@ -98,7 +112,7 @@ func (c *CLI) Execute(ctx context.Context, line string) (bool, error) {
 		if id == "" || rest == "" {
 			return false, fmt.Errorf("用法: update <编号> <新名称>")
 		}
-		if err := c.service.Update(ctx, id, rest); err != nil {
+		if err := c.devices.Update(ctx, id, rest); err != nil {
 			return false, err
 		}
 
@@ -106,7 +120,7 @@ func (c *CLI) Execute(ctx context.Context, line string) (bool, error) {
 		if id == "" || rest != "" {
 			return false, fmt.Errorf("用法: enable <编号>")
 		}
-		if err := c.service.Enable(ctx, id); err != nil {
+		if err := c.devices.Enable(ctx, id); err != nil {
 			return false, err
 		}
 
@@ -114,7 +128,7 @@ func (c *CLI) Execute(ctx context.Context, line string) (bool, error) {
 		if id == "" || rest != "" {
 			return false, fmt.Errorf("用法: disable <编号>")
 		}
-		if err := c.service.Disable(ctx, id); err != nil {
+		if err := c.devices.Disable(ctx, id); err != nil {
 			return false, err
 		}
 
@@ -122,9 +136,50 @@ func (c *CLI) Execute(ctx context.Context, line string) (bool, error) {
 		if id == "" || rest != "" {
 			return false, fmt.Errorf("用法: delete <编号>")
 		}
-		if err := c.service.Delete(ctx, id); err != nil {
+		if err := c.devices.Delete(ctx, id); err != nil {
 			return false, err
 		}
+
+	case "reset-secret":
+		if id == "" || rest != "" {
+			return false, fmt.Errorf("用法: reset-secret <编号>")
+		}
+		secret, err := c.devices.ResetSecret(ctx, id)
+		if err != nil {
+			return false, err
+		}
+		_, err = fmt.Fprintf(c.out, "OK\n密钥（仅显示一次）: %s\n", secret)
+		return false, err
+
+	case "receive":
+		if id == "" || rest == "" {
+			return false, fmt.Errorf("用法: receive <编号> <文件>")
+		}
+		payload, err := readPayload(rest)
+		if err != nil {
+			return false, err
+		}
+		if c.secretReader == nil {
+			return false, fmt.Errorf("未配置密钥输入")
+		}
+		secret, err := c.secretReader.ReadSecret()
+		if err != nil {
+			return false, err
+		}
+		if err := c.telemetry.Receive(ctx, id, secret, payload); err != nil {
+			return false, err
+		}
+
+	case "history":
+		query, err := parseHistoryQuery(args)
+		if err != nil {
+			return false, err
+		}
+		samples, err := c.telemetry.History(ctx, query)
+		if err != nil {
+			return false, err
+		}
+		return false, c.printJSON(samples)
 
 	default:
 		return false, fmt.Errorf("未知命令 %q，输入 help 查看帮助", command)
@@ -132,6 +187,51 @@ func (c *CLI) Execute(ctx context.Context, line string) (bool, error) {
 
 	_, err := fmt.Fprintln(c.out, "OK")
 	return false, err
+}
+
+func readPayload(path string) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("打开上报文件失败: %w", err)
+	}
+	defer file.Close()
+
+	// 多读一个字节即可判断超限，避免把特殊文件或超大文件完整读入内存。
+	payload, err := io.ReadAll(io.LimitReader(file, int64(telemetry.MaxPayloadBytes)+1))
+	if err != nil {
+		return nil, fmt.Errorf("读取上报文件失败: %w", err)
+	}
+	if len(payload) > telemetry.MaxPayloadBytes {
+		return nil, fmt.Errorf("上报文件超过大小限制：最大允许 %d 字节: %w", telemetry.MaxPayloadBytes, telemetry.ErrPayloadTooLarge)
+	}
+	return payload, nil
+}
+
+func parseHistoryQuery(args string) (telemetry.HistoryQuery, error) {
+	fields := strings.Fields(args)
+	if len(fields) < 2 || len(fields) > 4 {
+		return telemetry.HistoryQuery{}, fmt.Errorf("用法: history <编号> <数量> [起始时间] [结束时间]")
+	}
+	limit, err := strconv.Atoi(fields[1])
+	if err != nil || limit <= 0 {
+		return telemetry.HistoryQuery{}, fmt.Errorf("历史数量必须是大于 0 的整数")
+	}
+	query := telemetry.HistoryQuery{DeviceID: fields[0], Limit: limit}
+	if len(fields) >= 3 {
+		from, err := time.Parse(time.RFC3339, fields[2])
+		if err != nil {
+			return telemetry.HistoryQuery{}, fmt.Errorf("起始时间必须是 RFC3339: %w", err)
+		}
+		query.From = &from
+	}
+	if len(fields) == 4 {
+		to, err := time.Parse(time.RFC3339, fields[3])
+		if err != nil {
+			return telemetry.HistoryQuery{}, fmt.Errorf("结束时间必须是 RFC3339: %w", err)
+		}
+		query.To = &to
+	}
+	return query, nil
 }
 
 func (c *CLI) printJSON(value any) error {

@@ -49,15 +49,23 @@ func validateName(name string) error {
 	return nil
 }
 
-func (s *Service) Create(ctx context.Context, id, name string) error {
+func (s *Service) Create(ctx context.Context, id, name string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+
 	id = strings.TrimSpace(id)
 	name = strings.TrimSpace(name)
 
 	if err := validateID(id); err != nil {
-		return err
+		return "", err
 	}
 	if err := validateName(name); err != nil {
-		return err
+		return "", err
+	}
+	secret, err := GenerateSecret()
+	if err != nil {
+		return "", fmt.Errorf("生成设备密钥失败: %w", err)
 	}
 
 	now := s.currentTime()
@@ -69,11 +77,26 @@ func (s *Service) Create(ctx context.Context, id, name string) error {
 		UpdatedAt: now,
 	}
 
-	if err := s.repo.Create(ctx, d); err != nil {
-		return fmt.Errorf("新增设备 %q 失败： %w", id, err)
+	if err := s.repo.Create(ctx, d, HashSecret(secret)); err != nil {
+		return "", fmt.Errorf("新增设备 %q 失败： %w", id, err)
 	}
 
-	return nil
+	return secret, nil
+}
+
+func (s *Service) ResetSecret(ctx context.Context, id string) (string, error) {
+	id = strings.TrimSpace(id)
+	if err := validateID(id); err != nil {
+		return "", err
+	}
+	secret, err := GenerateSecret()
+	if err != nil {
+		return "", fmt.Errorf("生成设备密钥失败: %w", err)
+	}
+	if err := s.repo.ResetSecret(ctx, id, HashSecret(secret), s.currentTime()); err != nil {
+		return "", fmt.Errorf("重置设备 %q 密钥失败: %w", id, err)
+	}
+	return secret, nil
 }
 
 func (s *Service) Get(ctx context.Context, id string) (Device, error) {

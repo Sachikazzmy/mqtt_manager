@@ -57,11 +57,9 @@ type Sample struct {
 	Metrics    map[string]MetricValue `json:"metrics"`
 }
 
-type LatestStatus struct {
-	DeviceID       string                 `json:"device_id"`
-	MessageID      string                 `json:"message_id"`
-	SampledAt      time.Time              `json:"sampled_at"`
-	ReceivedAt     time.Time              `json:"received_at"`
-	LastReceivedAt time.Time              `json:"last_received_at"`
-	Metrics        map[string]MetricValue `json:"metrics"`
+type HistoryQuery struct {
+	DeviceID string
+	From     *time.Time
+	To       *time.Time
+	Limit    int
 }

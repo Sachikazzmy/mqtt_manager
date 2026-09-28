@@ -8,6 +8,8 @@ import (
 
 	"Project/internal/cli"
 	"Project/internal/device"
+	"Project/internal/storage"
+	"Project/internal/telemetry"
 )
 
 func main() {
@@ -21,9 +23,10 @@ func run() error {
 	ctx := context.Background()
 
 	// main 只负责创建对象并连接依赖。
-	repo := device.NewMemoryRepository()
-	service := device.NewService(repo)
-	commands := cli.New(service, os.Stdout)
+	store := storage.NewMemoryStore()
+	devices := device.NewService(store)
+	telemetryService := telemetry.NewService(store)
+	commands := cli.New(devices, telemetryService, os.Stdout, cli.NewTerminalSecretReader(os.Stdout))
 
 	fmt.Println(cli.Help)
 
