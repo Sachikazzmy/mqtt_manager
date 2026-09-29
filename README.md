@@ -51,6 +51,70 @@ quit
 
 必填字段、消息大小和长度都会校验。`value: 0` 是合法值，缺少 `value` 会拒收。`message_id` 必须在同一设备重启后仍保持唯一，去重键为 `(device_id, message_id)`。
 
+## MQTT 上报标准（v1）
+
+完成 MQTT 接入后，设备只能通过下面的 Topic 和 JSON 载荷进入业务接收流程。JSON 的字段顺序和空白不重要，但字段名、字段类型、允许的指标和业务规则必须符合本节；MQTT 回调不得绕过 `telemetry.Receive` 直接写入存储。
+
+### Topic
+
+```text
+factory/{device_id}/telemetry
+```
+
+后端订阅 `factory/+/telemetry`。设备发布时的 `{device_id}` 必须与 JSON 中的 `device_id` 一致。其他 Topic、通配符 Topic 或无法解析出唯一设备编号的消息都拒绝，不进入遥测处理。
+
+### 载荷
+
+载荷编码为 UTF-8 JSON 对象，最大 64 KiB。标准示例：
+
+```json
+{
+  "version": "1",
+  "device_id": "device-001",
+  "message_id": "01J8V3Y7Q5M4K2N6P8R0S1T2U3",
+  "sampled_at": "2026-09-29T04:15:30.123Z",
+  "metrics": {
+    "temperature": {"value": 23.6, "unit": "C"},
+    "pressure": {"value": 101.3, "unit": "kPa"},
+    "current": {"value": 2.5, "unit": "A"}
+  }
+}
+```
+
+字段规则：
+
+| 字段 | 类型和要求 |
+| --- | --- |
+| `version` | 必填字符串，只允许 `"1"`。 |
+| `device_id` | 必填非空字符串，最多 64 字节，必须与 Topic 中的设备编号一致。 |
+| `message_id` | 必填非空字符串，最多 128 字节；同一设备跨重启不能重复，推荐使用设备持久化的 UUID 或 ULID。 |
+| `sampled_at` | 必填 RFC3339 时间，必须带时区；设备端推荐统一发送 UTC 的 `Z`，后端按 UTC 保存。明显晚于服务端时间的消息拒绝，默认容差为 5 分钟。 |
+| `metrics` | 必填非空对象，最多 64 项；每项只能是下表中的指标对象。可以只上报设备实际具备的一个或多个指标。 |
+
+指标名称和单位是固定配对：
+
+| 指标名称 | `unit` | `value` |
+| --- | --- | --- |
+| `temperature` | `C` | 有限 JSON 数字，`0` 合法 |
+| `pressure` | `kPa` | 有限 JSON 数字，`0` 合法 |
+| `current` | `A` | 有限 JSON 数字，`0` 合法 |
+
+`value` 缺失、为 `null`、使用字符串表示、为 `NaN`/无穷大或 `unit` 不匹配时拒绝。当前默认不假设硬件量程；部署配置量程后，超出配置范围的值也拒绝。
+
+消息中不得出现未定义字段，不得把密钥、摘要、接收时间或设备配置放入 JSON。密钥由 MQTT 认证或其他受控的设备认证流程单独提供给后端，不能通过 Topic、JSON 或日志传递。
+
+### MQTT 回调的唯一入口
+
+MQTT 适配层应只做以下工作：解析并校验 Topic、取得已认证设备对应的密钥、建立带超时的 `context`，然后调用：
+
+```go
+err := telemetryService.Receive(ctx, topicDeviceID, deviceSecret, payload)
+```
+
+`Receive` 成功后才视为业务接收成功；它会继续检查设备存在、密钥、启用状态、Topic 与载荷身份一致性、载荷格式、时间和去重。失败消息不得写入历史或 Latest。重复的 `(device_id, message_id)` 不产生第二条历史记录，也不更新状态。MQTT 层不得另写一套 JSON 解析或直接调用 `storage.Commit`。
+
+因此，下面这些情况都不会进入存储：Topic 不符合格式、Topic 与 `device_id` 不一致、缺字段或多字段、未知指标、单位错误、数值非法、消息过大、时间明显超前、未知或禁用设备、密钥错误以及重复消息。
+
 ## 状态语义
 
 设备创建后 `latest` 为 `null`。收到合法且非重复消息后，设备对象中的 `latest` 保存该条消息的完整指标快照，包含指标、采样时间、接收时间、最后有效接收时间和消息 ID；它不会把不同消息的指标合并。
