@@ -1,0 +1,93 @@
+x-backend: &backend
+  image: project01-backend:stage3
+  build: .
+  environment:
+    MQTT_ADDRESS: broker:8883
+    MQTT_SERVER_NAME: broker
+    MQTT_CA_FILE: /run/secrets/mqtt_ca_cert
+    MQTT_ADMIN_PASSWORD_FILE: /run/secrets/dynsec_admin_password
+    MQTT_RECEIVER_PASSWORD_FILE: /run/secrets/mqtt_receiver_password
+    MQTT_QUEUE_SIZE: ${MQTT_QUEUE_SIZE:-128}
+  secrets:
+    - dynsec_admin_password
+    - mqtt_receiver_password
+    - mqtt_ca_cert
+  read_only: true
+  tmpfs:
+    - /tmp:mode=1777
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+
+services:
+  broker:
+    image: eclipse-mosquitto:2.1.2-alpine
+    restart: unless-stopped
+    ports:
+      - "${MQTT_BIND_ADDRESS:-0.0.0.0}:${MQTT_TLS_PORT:-8883}:8883"
+      # Plain WebSocket is only reachable locally, for the host's cloudflared.
+      - "127.0.0.1:${MQTT_WS_PORT:-9001}:9001"
+    volumes:
+      - mosquitto-data:/mosquitto/data
+      - ./deploy/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    secrets:
+      - dynsec_admin_password
+      - mosquitto_server_cert
+      - mosquitto_server_key
+    healthcheck:
+      test: ["CMD-SHELL", "test -s /mosquitto/data/dynamic-security.json && nc -z 127.0.0.1 8883"]
+      interval: 5s
+      timeout: 2s
+      retries: 12
+
+  broker-init:
+    <<: *backend
+    command: ["broker-setup"]
+    restart: on-failure
+    depends_on:
+      broker:
+        condition: service_healthy
+
+  backend:
+    <<: *backend
+    command: ["server"]
+    # CLI prints one-time device credentials; never persist its terminal output.
+    logging:
+      driver: none
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+    stop_grace_period: 20s
+    environment:
+      MQTT_ADDRESS: broker:8883
+      MQTT_SERVER_NAME: broker
+      MQTT_CA_FILE: /run/secrets/mqtt_ca_cert
+      MQTT_ADMIN_PASSWORD_FILE: /run/secrets/dynsec_admin_password
+      MQTT_RECEIVER_PASSWORD_FILE: /run/secrets/mqtt_receiver_password
+      MQTT_QUEUE_SIZE: ${MQTT_QUEUE_SIZE:-128}
+      MQTT_READINESS_FILE: /tmp/mqtt-ready
+    depends_on:
+      broker-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/mqtt-ready"]
+      interval: 5s
+      timeout: 2s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  mosquitto-data:
+
+secrets:
+  dynsec_admin_password:
+    file: ./.secrets/dynsec_admin_password
+  mosquitto_server_cert:
+    file: ./.secrets/mosquitto/server.crt
+  mosquitto_server_key:
+    file: ./.secrets/mosquitto/server.key
+  mqtt_receiver_password:
+    file: ./.secrets/receiver_password
+  mqtt_ca_cert:
+    file: ./.secrets/mosquitto/ca.crt

@@ -1,0 +1,9 @@
+.git
+.secrets
+.env
+.env.*
+!.env.example
+handoff
+sub_device
+**/*_test.go
+*.log
