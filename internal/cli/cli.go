@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"Project/internal/device"
+	"Project/internal/receive"
 	"Project/internal/telemetry"
 )
 
@@ -238,4 +240,47 @@ func (c *CLI) printJSON(value any) error {
 	encoder := json.NewEncoder(c.out)
 	encoder.SetIndent("", "  ")
 	return encoder.Encode(value)
+}
+
+func (c *CLI) PrintEvent(event receive.Event) error {
+	switch event.Type {
+	case "broker":
+		if event.Reason == "" {
+			_, err := fmt.Fprintf(c.out, "[MQTT] 状态=%s\n", event.Status)
+			return err
+		}
+		_, err := fmt.Fprintf(c.out, "[MQTT] 状态=%s %s\n", event.Status, event.Reason)
+		return err
+	case "accepted":
+		_, err := fmt.Fprintf(c.out, "[MQTT] 接收成功 device_id=%s message_id=%s metrics=%s\n", event.DeviceID, event.MessageID, formatMetrics(event.Metrics))
+		return err
+	case "duplicate":
+		_, err := fmt.Fprintf(c.out, "[MQTT] 重复消息 device_id=%s message_id=%s\n", event.DeviceID, event.MessageID)
+		return err
+	case "reject":
+		_, err := fmt.Fprintf(c.out, "[MQTT] 拒收 device_id=%s message_id=%s reason=%s\n", event.DeviceID, event.MessageID, event.Reason)
+		return err
+	case "retry":
+		_, err := fmt.Fprintf(c.out, "[MQTT] 暂未提交 device_id=%s message_id=%s reason=%s\n", event.DeviceID, event.MessageID, event.Reason)
+		return err
+	case "queue_full", "notice":
+		_, err := fmt.Fprintf(c.out, "[MQTT] %s device_id=%s message_id=%s\n", event.Reason, event.DeviceID, event.MessageID)
+		return err
+	default:
+		return nil
+	}
+}
+
+func formatMetrics(metrics map[string]telemetry.MetricValue) string {
+	names := make([]string, 0, len(metrics))
+	for name := range metrics {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	values := make([]string, 0, len(names))
+	for _, name := range names {
+		metric := metrics[name]
+		values = append(values, fmt.Sprintf("%s=%.6g%s", name, metric.Value, metric.Unit))
+	}
+	return strings.Join(values, ",")
 }

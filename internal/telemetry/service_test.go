@@ -1,6 +1,7 @@
 package telemetry_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -290,6 +291,114 @@ func TestHistoryResourceLimitsAndCancellation(t *testing.T) {
 	cancel()
 	if _, err := service.History(canceled, telemetry.HistoryQuery{DeviceID: "device-001", Limit: 10}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("取消历史查询错误 = %v", err)
+	}
+}
+
+func TestReceiveFromBrokerCommitsLatestAndHistoryAtomically(t *testing.T) {
+	ctx := context.Background()
+	_, devices, service, _, clock := testSetup(t)
+	payload := temperaturePayload("broker-1", "2026-09-27T11:59:00Z", "0")
+
+	result, err := service.ReceiveFromBroker(ctx, "factory/device-001/telemetry", payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.DeviceID != "device-001" || result.MessageID != "broker-1" || result.Metrics["temperature"].Value != 0 {
+		t.Fatalf("Broker 接收结果 = %#v", result)
+	}
+	d, err := devices.Get(ctx, "device-001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Latest == nil || d.Latest.MessageID != "broker-1" || d.Latest.Metrics["temperature"].Value != 0 || !d.Latest.LastValidReceivedAt.Equal(*clock) {
+		t.Fatalf("Broker 接收没有原子更新 Latest: %#v", d.Latest)
+	}
+	history, err := service.History(ctx, telemetry.HistoryQuery{DeviceID: "device-001", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(history) != 1 || history[0].MessageID != "broker-1" {
+		t.Fatalf("Broker 接收历史 = %#v", history)
+	}
+	if _, err := service.ReceiveFromBroker(ctx, "factory/device-001/telemetry", payload); !errors.Is(err, telemetry.ErrDuplicateMessage) {
+		t.Fatalf("重复 Broker 消息错误 = %v", err)
+	}
+	history, err = service.History(ctx, telemetry.HistoryQuery{DeviceID: "device-001", Limit: 10})
+	if err != nil || len(history) != 1 {
+		t.Fatalf("重复消息不应新增历史: len=%d err=%v", len(history), err)
+	}
+}
+
+func TestReceiveFromBrokerRejectsWrongTopicIdentityAndDisabledDevice(t *testing.T) {
+	ctx := context.Background()
+	_, devices, service, _, _ := testSetup(t)
+	valid := temperaturePayload("valid", "2026-09-27T11:59:00Z", "1")
+
+	for _, topic := range []string{
+		"factory/device-001/telemetry/extra",
+		"factory/+/telemetry",
+		"factory/device/001/telemetry",
+		"factory/device-001/other",
+		"$CONTROL/dynamic-security/v1",
+	} {
+		if _, err := service.ReceiveFromBroker(ctx, topic, valid); !errors.Is(err, telemetry.ErrInvalidTopic) {
+			t.Errorf("Topic %q 错误 = %v", topic, err)
+		}
+	}
+	if _, err := service.ReceiveFromBroker(ctx, "factory/device-002/telemetry", valid); !errors.Is(err, telemetry.ErrDeviceMismatch) {
+		t.Fatalf("跨设备 Topic 错误 = %v", err)
+	}
+	unknownPayload := messagePayload("device-002", "unknown", "2026-09-27T11:59:00Z", `{"temperature":{"value":1,"unit":"C"}}`)
+	if _, err := service.ReceiveFromBroker(ctx, "factory/device-002/telemetry", unknownPayload); !errors.Is(err, device.ErrNotFound) {
+		t.Fatalf("未知 Broker 设备错误 = %v", err)
+	}
+	if err := devices.Disable(ctx, "device-001"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.ReceiveFromBroker(ctx, "factory/device-001/telemetry", valid); !errors.Is(err, telemetry.ErrDeviceDisabled) {
+		t.Fatalf("禁用 Broker 设备错误 = %v", err)
+	}
+}
+
+func TestReceiveFromBrokerPayloadBoundary(t *testing.T) {
+	ctx := context.Background()
+	_, _, service, _, _ := testSetup(t)
+	base := temperaturePayload("boundary", "2026-09-27T11:59:00Z", "1")
+	if len(base) >= telemetry.MaxPayloadBytes {
+		t.Fatalf("测试基础消息意外过大: %d", len(base))
+	}
+	maxPayload := append(append([]byte(nil), base...), bytes.Repeat([]byte{' '}, telemetry.MaxPayloadBytes-len(base))...)
+	if _, err := service.ReceiveFromBroker(ctx, "factory/device-001/telemetry", maxPayload); err != nil {
+		t.Fatalf("恰好 %d 字节应接受: %v", telemetry.MaxPayloadBytes, err)
+	}
+	tooLarge := append(maxPayload, ' ')
+	if _, err := service.ReceiveFromBroker(ctx, "factory/device-001/telemetry", tooLarge); !errors.Is(err, telemetry.ErrPayloadTooLarge) {
+		t.Fatalf("超过边界的载荷错误 = %v", err)
+	}
+}
+
+func TestReceiveFromBrokerRejectsStrictProtocolViolations(t *testing.T) {
+	ctx := context.Background()
+	_, _, service, _, _ := testSetup(t)
+	cases := []struct {
+		name    string
+		payload []byte
+	}{
+		{"extra field", []byte(`{"version":"1","device_id":"device-001","message_id":"extra","sampled_at":"2026-09-27T11:59:00Z","metrics":{"temperature":{"value":1,"unit":"C"}},"secret":"x"}`)},
+		{"second JSON", append(temperaturePayload("second", "2026-09-27T11:59:00Z", "1"), []byte(` {}`)...)},
+		{"string number", messagePayload("device-001", "string", "2026-09-27T11:59:00Z", `{"temperature":{"value":"1","unit":"C"}}`)},
+		{"null number", messagePayload("device-001", "null", "2026-09-27T11:59:00Z", `{"temperature":{"value":null,"unit":"C"}}`)},
+		{"unknown metric", messagePayload("device-001", "metric", "2026-09-27T11:59:00Z", `{"voltage":{"value":1,"unit":"V"}}`)},
+		{"unit mismatch", messagePayload("device-001", "unit", "2026-09-27T11:59:00Z", `{"temperature":{"value":1,"unit":"F"}}`)},
+		{"time without zone", messagePayload("device-001", "time", "2026-09-27T11:59:00", `{"temperature":{"value":1,"unit":"C"}}`)},
+		{"future timestamp", temperaturePayload("future", "2026-09-27T12:06:00Z", "1")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := service.ReceiveFromBroker(ctx, "factory/device-001/telemetry", tc.payload); !errors.Is(err, telemetry.ErrInvalidMessage) {
+				t.Fatalf("错误 = %v", err)
+			}
+		})
 	}
 }
 

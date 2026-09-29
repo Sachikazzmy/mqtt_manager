@@ -11,6 +11,7 @@ import (
 
 	"Project/internal/cli"
 	"Project/internal/device"
+	"Project/internal/receive"
 	"Project/internal/storage"
 	"Project/internal/telemetry"
 )
@@ -146,5 +147,39 @@ func TestQuit(t *testing.T) {
 	}
 	if !quit {
 		t.Fatal("quit 应该要求调用方退出")
+	}
+}
+
+func TestPrintEventShowsMQTTResultAndBrokerState(t *testing.T) {
+	var out bytes.Buffer
+	commands := cli.New(nil, nil, &out, nil)
+	events := []receive.Event{
+		{
+			Type:      "accepted",
+			DeviceID:  "device-001",
+			MessageID: "message-001",
+			Metrics: map[string]telemetry.MetricValue{
+				"temperature": {Value: 0, Unit: "C"},
+			},
+		},
+		{Type: "duplicate", DeviceID: "device-001", MessageID: "message-001"},
+		{Type: "reject", DeviceID: "device-001", MessageID: "message-002", Reason: "协议错误"},
+		{Type: "broker", Status: "offline", Reason: "连接中断"},
+	}
+	for _, event := range events {
+		if err := commands.PrintEvent(event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, expected := range []string{
+		"接收成功 device_id=device-001 message_id=message-001",
+		"temperature=0C",
+		"重复消息 device_id=device-001 message_id=message-001",
+		"拒收 device_id=device-001 message_id=message-002 reason=协议错误",
+		"[MQTT] 状态=offline 连接中断",
+	} {
+		if !strings.Contains(out.String(), expected) {
+			t.Errorf("终端事件输出缺少 %q:\n%s", expected, out.String())
+		}
 	}
 }

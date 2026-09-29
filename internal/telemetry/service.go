@@ -31,6 +31,7 @@ const (
 var (
 	ErrPayloadTooLarge = errors.New("遥测消息超过大小限制")
 	ErrInvalidMessage  = errors.New("遥测消息格式无效")
+	ErrInvalidTopic    = errors.New("遥测 Topic 无效")
 	ErrDeviceMismatch  = errors.New("入口设备编号与消息设备编号不一致")
 	ErrDeviceDisabled  = errors.New("设备已禁用")
 	ErrHistoryLimit    = errors.New("历史数量限制无效")
@@ -111,8 +112,6 @@ func parseMessage(payload []byte) (Message, error) {
 }
 
 func normalizeMessage(msg *Message) error {
-	msg.Version = strings.TrimSpace(msg.Version)
-	msg.DeviceID = strings.TrimSpace(msg.DeviceID)
 	msg.MessageID = strings.TrimSpace(msg.MessageID)
 	msg.SampledAt = msg.SampledAt.UTC()
 	if msg.Metrics == nil {
@@ -121,11 +120,9 @@ func normalizeMessage(msg *Message) error {
 
 	metrics := make(map[string]MetricValue, len(msg.Metrics))
 	for name, metric := range msg.Metrics {
-		name = strings.TrimSpace(name)
 		if _, exists := metrics[name]; exists {
 			return fmt.Errorf("%w：metric 名称规范化后重复", ErrInvalidMessage)
 		}
-		metric.Unit = strings.TrimSpace(metric.Unit)
 		metrics[name] = metric
 	}
 	msg.Metrics = metrics
@@ -199,42 +196,82 @@ func validateID(field, id string) error {
 	if id == "" {
 		return fmt.Errorf("%w：%s 不能为空", ErrInvalidMessage, field)
 	}
+	if id == "admin" {
+		return fmt.Errorf("%w：%s 不能使用 Broker 管理账户编号", ErrInvalidMessage, field)
+	}
 	if len(id) > maxDeviceIDBytes {
 		return fmt.Errorf("%w：%s 不能超过 %d 字节", ErrInvalidMessage, field, maxDeviceIDBytes)
+	}
+	for index, value := range id {
+		allowed := value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' || value >= '0' && value <= '9' || value == '_' || value == '-'
+		if !allowed || index == 0 && !(value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' || value >= '0' && value <= '9') {
+			return fmt.Errorf("%w：%s 包含不允许的字符", ErrInvalidMessage, field)
+		}
 	}
 	return nil
 }
 
 func (s *Service) Receive(ctx context.Context, deviceID, secret string, payload []byte) error {
+	_, err := s.receive(ctx, deviceID, secret, payload, false)
+	return err
+}
+
+type ReceiveResult struct {
+	DeviceID  string                 `json:"device_id"`
+	MessageID string                 `json:"message_id"`
+	Metrics   map[string]MetricValue `json:"metrics"`
+}
+
+func (s *Service) ReceiveFromBroker(ctx context.Context, topic string, payload []byte) (ReceiveResult, error) {
+	deviceID, err := deviceIDFromTopic(topic)
+	if err != nil {
+		return ReceiveResult{}, err
+	}
+	return s.receive(ctx, deviceID, "", payload, true)
+}
+
+func deviceIDFromTopic(topic string) (string, error) {
+	parts := strings.Split(topic, "/")
+	if len(parts) != 3 || parts[0] != "factory" || parts[2] != "telemetry" {
+		return "", fmt.Errorf("%w：只接受 factory/{device_id}/telemetry", ErrInvalidTopic)
+	}
+	if err := validateID("Topic 设备编号", parts[1]); err != nil {
+		return "", fmt.Errorf("%w：%v", ErrInvalidTopic, err)
+	}
+	return parts[1], nil
+}
+
+func (s *Service) receive(ctx context.Context, deviceID, secret string, payload []byte, brokerAuthenticated bool) (ReceiveResult, error) {
+	var result ReceiveResult
 	if err := ctx.Err(); err != nil {
-		return err
+		return result, err
 	}
 	if len(payload) > MaxPayloadBytes {
-		return fmt.Errorf("%w：%d 字节，最大允许 %d 字节", ErrPayloadTooLarge, len(payload), MaxPayloadBytes)
+		return result, fmt.Errorf("%w：%d 字节，最大允许 %d 字节", ErrPayloadTooLarge, len(payload), MaxPayloadBytes)
 	}
 
-	deviceID = strings.TrimSpace(deviceID)
 	if err := validateID("入口设备编号", deviceID); err != nil {
-		return err
+		return result, err
 	}
 
 	msg, err := parseMessage(payload)
 	if err != nil {
-		return err
+		return result, err
 	}
 	if err := normalizeMessage(&msg); err != nil {
-		return err
+		return result, err
 	}
+	result = ReceiveResult{DeviceID: msg.DeviceID, MessageID: msg.MessageID, Metrics: cloneMetrics(msg.Metrics)}
 	if msg.DeviceID != deviceID {
-		return fmt.Errorf("%w：入口=%q payload=%q", ErrDeviceMismatch, deviceID, msg.DeviceID)
+		return result, fmt.Errorf("%w：入口=%q payload=%q", ErrDeviceMismatch, deviceID, msg.DeviceID)
 	}
 
 	receivedAt := s.now().UTC()
 	if err := s.validateMessage(msg, receivedAt); err != nil {
-		return err
+		return result, err
 	}
 	if err := ctx.Err(); err != nil {
-		return err
+		return result, err
 	}
 
 	sample := Sample{
@@ -244,11 +281,16 @@ func (s *Service) Receive(ctx context.Context, deviceID, secret string, payload 
 		ReceivedAt: receivedAt,
 		Metrics:    cloneMetrics(msg.Metrics),
 	}
-	if err := s.repo.Commit(ctx, deviceID, secret, sample); err != nil {
-		return fmt.Errorf("保存遥测消息失败：%w", err)
+	if brokerAuthenticated {
+		err = s.repo.CommitFromBroker(ctx, deviceID, sample)
+	} else {
+		err = s.repo.Commit(ctx, deviceID, secret, sample)
+	}
+	if err != nil {
+		return result, fmt.Errorf("保存遥测消息失败：%w", err)
 	}
 
-	return nil
+	return result, nil
 }
 
 func (s *Service) History(ctx context.Context, query HistoryQuery) ([]Sample, error) {

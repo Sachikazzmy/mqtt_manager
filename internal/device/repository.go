@@ -13,6 +13,7 @@ var (
 )
 
 type Repository interface {
+	CheckCreate(ctx context.Context, id string) error
 	Create(ctx context.Context, d Device, secretDigest SecretDigest) error
 	Get(ctx context.Context, id string) (Device, error)
 	List(ctx context.Context) ([]Device, error)

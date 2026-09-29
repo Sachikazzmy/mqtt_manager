@@ -41,6 +41,21 @@ func NewMemoryStore() *MemoryStore {
 	}
 }
 
+func (s *MemoryStore) CheckCreate(ctx context.Context, id string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if _, deleted := s.deletedIDs[id]; deleted {
+		return device.ErrIDDeleted
+	}
+	if _, exists := s.devices[id]; exists {
+		return device.ErrExists
+	}
+	return nil
+}
+
 func (s *MemoryStore) Create(ctx context.Context, config device.Device, secretDigest device.SecretDigest) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -175,6 +190,15 @@ func (s *MemoryStore) Delete(ctx context.Context, id string) error {
 }
 
 func (s *MemoryStore) Commit(ctx context.Context, deviceID, secret string, sample telemetry.Sample) error {
+	return s.commit(ctx, deviceID, &secret, sample)
+}
+
+// CommitFromBroker 仅供已通过 MQTT Broker 认证和 Topic ACL 的接收适配层调用。
+func (s *MemoryStore) CommitFromBroker(ctx context.Context, deviceID string, sample telemetry.Sample) error {
+	return s.commit(ctx, deviceID, nil, sample)
+}
+
+func (s *MemoryStore) commit(ctx context.Context, deviceID string, secret *string, sample telemetry.Sample) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -192,9 +216,11 @@ func (s *MemoryStore) Commit(ctx context.Context, deviceID, secret string, sampl
 	if sample.DeviceID != deviceID {
 		return telemetry.ErrDeviceMismatch
 	}
-	provided := device.HashSecret(secret)
-	if !hmac.Equal(record.secretDigest[:], provided[:]) {
-		return telemetry.ErrInvalidSecret
+	if secret != nil {
+		provided := device.HashSecret(*secret)
+		if !hmac.Equal(record.secretDigest[:], provided[:]) {
+			return telemetry.ErrInvalidSecret
+		}
 	}
 	if !record.config.Enabled {
 		return telemetry.ErrDeviceDisabled

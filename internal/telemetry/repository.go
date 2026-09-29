@@ -13,5 +13,7 @@ var (
 type Repository interface {
 	// Commit 必须在同一存储操作中完成设备状态校验、认证、去重、历史保存和 Latest 更新。
 	Commit(ctx context.Context, deviceID, secret string, sample Sample) error
+	// CommitFromBroker 仅用于已由受信任 MQTT Broker 认证和授权的消息入口。
+	CommitFromBroker(ctx context.Context, deviceID string, sample Sample) error
 	History(ctx context.Context, query HistoryQuery) ([]Sample, error)
 }
