@@ -1,6 +1,5 @@
-#include<stdio.h>
+#include "app/gateway_app.h"
 
-int main() {
-    printf("Hello,World!\n");
-    return 0;
+int main(void) {
+    return app_run();
 }
