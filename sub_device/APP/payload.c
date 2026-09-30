@@ -7,76 +7,104 @@
 
 static int build_sampled_at(char *buffer, size_t buffer_size) {
     time_t now = time(NULL);
+    struct tm *utc_time;
+    int written;
+
     if (now == (time_t)-1) {
         return -1;
     }
 
-    struct tm *utc_time = gmtime(&now);
+    utc_time = gmtime(&now);
     if (utc_time == NULL) {
         return -1;
     }
 
-    int written = snprintf(
-        buffer,
-        buffer_size,
-        "%04d-%02d-%02dT%02d:%02d:%02d.000Z",
-        utc_time->tm_year + 1900,
-        utc_time->tm_mon + 1,
-        utc_time->tm_mday,
-        utc_time->tm_hour,
-        utc_time->tm_min,
-        utc_time->tm_sec
-    );
+    written = snprintf(buffer, buffer_size,
+                       "%04d-%02d-%02dT%02d:%02d:%02d.000Z",
+                       utc_time->tm_year + 1900,
+                       utc_time->tm_mon + 1,
+                       utc_time->tm_mday,
+                       utc_time->tm_hour,
+                       utc_time->tm_min,
+                       utc_time->tm_sec);
 
-    if (written < 0 || (size_t)written >= buffer_size) {
+    return written >= 0 && (size_t)written < buffer_size ? 0 : -1;
+}
+
+static int next_persistent_sequence(uint64_t *sequence) {
+    const char *state_file = getenv("MESSAGE_ID_STATE_FILE");
+    char temp_file[512];
+    FILE *file;
+    unsigned long long value = 0;
+
+    if (state_file == NULL || state_file[0] == '\0') {
+        state_file = ".message-sequence";
+    }
+
+    file = fopen(state_file, "r");
+    if (file != NULL) {
+        if (fscanf(file, "%llu", &value) != 1) {
+            value = 0;
+        }
+        fclose(file);
+    }
+
+    if (value == UINT64_MAX) {
+        return -1;
+    }
+    value++;
+
+    if (snprintf(temp_file, sizeof(temp_file), "%s.tmp", state_file) >=
+        (int)sizeof(temp_file)) {
         return -1;
     }
 
+    file = fopen(temp_file, "w");
+    if (file == NULL) {
+        return -1;
+    }
+
+    if (fprintf(file, "%llu\n", value) < 0 || fclose(file) != 0) {
+        remove(temp_file);
+        return -1;
+    }
+
+    if (rename(temp_file, state_file) != 0) {
+        remove(temp_file);
+        return -1;
+    }
+
+    *sequence = (uint64_t)value;
     return 0;
 }
 
 static int build_message_id(char *buffer, size_t buffer_size) {
+    uint64_t sequence;
     time_t now = time(NULL);
-    if (now == (time_t)-1) {
+    int written;
+
+    if (now == (time_t)-1 || next_persistent_sequence(&sequence) != 0) {
         return -1;
     }
 
-    unsigned int random_part = (unsigned int)rand();
-    unsigned long long clock_part = (unsigned long long)clock();
-    unsigned long long address_part = (unsigned long long)(uintptr_t)buffer;
+    written = snprintf(buffer, buffer_size, "device-001-%lld-%llu",
+                       (long long)now,
+                       (unsigned long long)sequence);
 
-    int written = snprintf(
-        buffer,
-        buffer_size,
-        "device-001-%lld-%llu-%llu-%u",
-        (long long)now,
-        clock_part,
-        address_part,
-        random_part
-    );
-
-    if (written < 0 || (size_t)written >= buffer_size) {
-        return -1;
-    }
-
-    return 0;
+    return written >= 0 && (size_t)written < buffer_size ? 0 : -1;
 }
 
-int payload_build(char *buffer, size_t buffer_size) {
+int payload_build(char *buffer, size_t buffer_size, const sensor_data_t *data) {
     char sampled_at[32];
     char message_id[128];
+    int written;
 
-    srand((unsigned int)time(NULL) ^ (unsigned int)clock() ^ (unsigned int)(uintptr_t)buffer);
-
-    if (build_sampled_at(sampled_at, sizeof(sampled_at)) != 0) {
+    if (data == NULL || build_sampled_at(sampled_at, sizeof(sampled_at)) != 0 ||
+        build_message_id(message_id, sizeof(message_id)) != 0) {
         return -1;
     }
 
-    if (build_message_id(message_id, sizeof(message_id)) != 0) {
-        return -1;
-    }
-
-    int written = snprintf(
+    written = snprintf(
         buffer,
         buffer_size,
         "{"
@@ -84,19 +112,16 @@ int payload_build(char *buffer, size_t buffer_size) {
         "\"device_id\":\"device-001\","
         "\"message_id\":\"%s\","
         "\"sampled_at\":\"%s\","
-        "\"metrics\":{"
-        "\"temperature\":{\"value\":23.6,\"unit\":\"C\"},"
-        "\"pressure\":{\"value\":101.3,\"unit\":\"kPa\"},"
-        "\"current\":{\"value\":2.5,\"unit\":\"A\"}"
-        "}"
-        "}",
+        "\"metrics\":{" 
+        "\"temperature\":{\"value\":%.2f,\"unit\":\"C\"},"
+        "\"pressure\":{\"value\":%.2f,\"unit\":\"kPa\"},"
+        "\"current\":{\"value\":%.2f,\"unit\":\"A\"}"
+        "}}",
         message_id,
-        sampled_at
-    );
+        sampled_at,
+        data->temperature,
+        data->pressure,
+        data->current);
 
-    if (written < 0 || (size_t)written >= buffer_size) {
-        return -1;
-    }
-
-    return written;
+    return written >= 0 && (size_t)written < buffer_size ? written : -1;
 }

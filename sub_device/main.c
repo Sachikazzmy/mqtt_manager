@@ -1,5 +1,5 @@
-#include "app/gateway_app.h"
+#include "APP/gateway_app.h"
 
-int main(void) {
-    return app_run();
+int main(int argc, char **argv) {
+    return app_run(argc, argv);
 }

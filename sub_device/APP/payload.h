@@ -3,6 +3,8 @@
 
 #include <stddef.h>
 
-int payload_build(char *buffer, size_t buffer_size);
+#include "metric.h"
+
+int payload_build(char *buffer, size_t buffer_size, const sensor_data_t *data);
 
 #endif
