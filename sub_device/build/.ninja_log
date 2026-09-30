@@ -1,0 +1,9 @@
+# ninja log v7
+3	67	8123723704930637	CMakeFiles/sub_device.dir/app/payload.c.obj	e6f48287c1e48365
+3	66	8123718031296241	CMakeFiles/sub_device.dir/app/gateway_app.c.obj	258b376f2fb9cb65
+3	54	8123713340681464	CMakeFiles/sub_device.dir/main.c.obj	1cf7ac2ebf001334
+76	147	8123737849657988	sub_device.exe	3824ee791fc03bbd
+1	70	8123737848910487	CMakeFiles/sub_device.dir/APP/gateway_app.c.obj	6efe3b06b28f8e01
+7	76	8123737848970282	CMakeFiles/sub_device.dir/APP/transport.c.obj	7bcf7e59a35ae481
+4	76	8123737848940387	CMakeFiles/sub_device.dir/APP/payload.c.obj	24fc2fcc8261ad1e
+2	71	8123742245406981	sub_device.exe	c8367ac960a113a3
