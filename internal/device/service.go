@@ -45,6 +45,13 @@ func newServiceWithClock(repo Repository, now func() time.Time, broker BrokerLif
 	}
 }
 
+func ValidateMetricLimit(limit int) error {
+	if limit < MinMetricLimit || limit > HardMaxMetricLimit {
+		return fmt.Errorf("每设备指标总数上限必须在 %d 到 %d 之间", MinMetricLimit, HardMaxMetricLimit)
+	}
+	return nil
+}
+
 func (s *Service) currentTime() time.Time {
 	return s.now().UTC()
 }
@@ -111,6 +118,9 @@ func (s *Service) Create(ctx context.Context, id, name string) (string, error) {
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
+	if durable, ok := s.repo.(DurableLifecycle); ok && s.broker != nil {
+		return s.durableCreate(ctx, durable, d, secret)
+	}
 
 	if s.broker != nil {
 		if err := s.broker.CreateDevice(ctx, id, secret); err != nil {
@@ -138,6 +148,9 @@ func (s *Service) ResetSecret(ctx context.Context, id string) (string, error) {
 	}
 	s.operationMu.Lock()
 	defer s.operationMu.Unlock()
+	if durable, ok := s.repo.(DurableLifecycle); ok && s.broker != nil {
+		return s.durableReset(ctx, durable, id)
+	}
 	existing, err := s.repo.Get(ctx, id)
 	if err != nil {
 		return "", fmt.Errorf("重置设备 %q 密钥失败：%w", id, err)
@@ -224,6 +237,9 @@ func (s *Service) setEnabled(ctx context.Context, id string, enabled bool) error
 	}
 	s.operationMu.Lock()
 	defer s.operationMu.Unlock()
+	if durable, ok := s.repo.(DurableLifecycle); ok && s.broker != nil {
+		return s.durableEnabled(ctx, durable, id, enabled)
+	}
 	existing, err := s.repo.Get(ctx, id)
 	if err != nil {
 		return fmt.Errorf("修改设备启用状态 %q 失败：%w", id, err)
@@ -290,6 +306,9 @@ func (s *Service) Delete(ctx context.Context, id string) error {
 	}
 	s.operationMu.Lock()
 	defer s.operationMu.Unlock()
+	if durable, ok := s.repo.(DurableLifecycle); ok && s.broker != nil {
+		return s.durableDelete(ctx, durable, id)
+	}
 	if _, err := s.repo.Get(ctx, id); err != nil {
 		return fmt.Errorf("删除设备 %q 失败：%w", id, err)
 	}

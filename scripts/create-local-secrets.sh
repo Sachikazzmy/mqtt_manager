@@ -6,7 +6,7 @@ umask 077
 mkdir -p .secrets/mosquitto
 chmod 700 .secrets .secrets/mosquitto
 
-for path in .secrets/dynsec_admin_password .secrets/receiver_password; do
+for path in .secrets/dynsec_admin_password .secrets/receiver_password .secrets/db_password; do
 	if [ ! -s "$path" ]; then
 		openssl rand -base64 32 > "$path"
 	fi
@@ -14,7 +14,7 @@ for path in .secrets/dynsec_admin_password .secrets/receiver_password; do
 done
 # Compose file secrets are bind mounts; non-root containers need read access.
 # The containing host directories remain mode 700.
-chmod 644 .secrets/dynsec_admin_password .secrets/receiver_password
+chmod 644 .secrets/dynsec_admin_password .secrets/receiver_password .secrets/db_password
 
 cert_dir=.secrets/mosquitto
 if [ -s "$cert_dir/ca.crt" ] && [ -s "$cert_dir/ca.key" ] && [ -s "$cert_dir/server.crt" ] && [ -s "$cert_dir/server.key" ]; then

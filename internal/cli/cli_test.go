@@ -24,7 +24,6 @@ func newCommands(out *bytes.Buffer, secretReader cli.SecretReader) (*cli.CLI, *d
 		return now
 	}, telemetry.Config{
 		MaxFutureSkew: 5 * time.Minute,
-		MetricRules:   telemetry.DefaultMetricRules(),
 	})
 	return cli.New(devices, telemetryService, out, secretReader), devices, telemetryService
 }
@@ -73,7 +72,6 @@ func TestReceiveCommandUsesSecretReader(t *testing.T) {
 		return now
 	}, telemetry.Config{
 		MaxFutureSkew: 5 * time.Minute,
-		MetricRules:   telemetry.DefaultMetricRules(),
 	})
 	secret, err := devices.Create(ctx, "device-001", "test")
 	if err != nil {
@@ -83,7 +81,7 @@ func TestReceiveCommandUsesSecretReader(t *testing.T) {
 	var out bytes.Buffer
 	commands := cli.New(devices, telemetryService, &out, reader)
 
-	payload := `{"version":"1","device_id":"device-001","message_id":"m-1","sampled_at":"2026-09-27T11:59:00Z","metrics":{"temperature":{"value":0,"unit":"C"}}}`
+	payload := `{"version":"1","device_id":"device-001","message_id":"m-1","sampled_at":"2026-09-27T11:59:00Z","metrics":{"segment-1":{"value":0,"unit":"V"}}}`
 	file := t.TempDir() + "/sample.json"
 	if err := os.WriteFile(file, []byte(payload), 0600); err != nil {
 		t.Fatal(err)
@@ -95,8 +93,31 @@ func TestReceiveCommandUsesSecretReader(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(samples) != 1 || samples[0].Metrics["temperature"].Value != 0 {
+	if len(samples) != 1 || samples[0].Metrics["segment-1"].Value != 0 {
 		t.Fatalf("历史记录 = %#v", samples)
+	}
+}
+
+func TestMetricManagementCommandIsRemovedAndDeviceOutputHidesDefinitions(t *testing.T) {
+	ctx := context.Background()
+	var out bytes.Buffer
+	commands, devices, _ := newCommands(&out, nil)
+	if _, err := devices.Create(ctx, "device-001", "测试设备"); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := commands.Execute(ctx, "metric list device-001"); err == nil || !strings.Contains(err.Error(), "未知命令") {
+		t.Fatalf("指标定义管理暂不提供 CLI 命令: %v", err)
+	}
+	if strings.Contains(cli.Help, "metric ") {
+		t.Fatalf("帮助中不应出现延期的指标管理命令: %s", cli.Help)
+	}
+	if _, err := commands.Execute(ctx, "list"); err != nil {
+		t.Fatal(err)
+	}
+	output := out.String()
+	if strings.Contains(output, "metric_definitions") || strings.Contains(output, "temperature") || strings.Contains(output, "pressure") || strings.Contains(output, "current") {
+		t.Fatalf("新设备 list 输出不应包含定义管理字段或旧默认项: %s", output)
 	}
 }
 
@@ -159,7 +180,7 @@ func TestPrintEventShowsMQTTResultAndBrokerState(t *testing.T) {
 			DeviceID:  "device-001",
 			MessageID: "message-001",
 			Metrics: map[string]telemetry.MetricValue{
-				"temperature": {Value: 0, Unit: "C"},
+				"segment-1": {Value: 0, Unit: "V"},
 			},
 		},
 		{Type: "duplicate", DeviceID: "device-001", MessageID: "message-001"},
@@ -173,7 +194,7 @@ func TestPrintEventShowsMQTTResultAndBrokerState(t *testing.T) {
 	}
 	for _, expected := range []string{
 		"接收成功 device_id=device-001 message_id=message-001",
-		"temperature=0C",
+		"segment-1=0V",
 		"重复消息 device_id=device-001 message_id=message-001",
 		"拒收 device_id=device-001 message_id=message-002 reason=协议错误",
 		"[MQTT] 状态=offline 连接中断",

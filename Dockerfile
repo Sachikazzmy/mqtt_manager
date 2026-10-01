@@ -11,5 +11,6 @@ FROM alpine:3.23.3
 RUN addgroup -g 10001 app && adduser -D -u 10001 -G app app
 WORKDIR /app
 COPY --from=build /out/ /usr/local/bin/
+COPY --from=build /src/migrations /app/migrations
 USER 10001:10001
 CMD ["server"]

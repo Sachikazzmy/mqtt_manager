@@ -29,7 +29,7 @@ const Help = `命令：
   receive <编号> <文件>   从本地 JSON 文件模拟上报
   history <编号> <数量> [起始时间] [结束时间]
   help                    显示帮助
-  quit                    退出（内存数据会丢失）`
+  quit                    退出服务（数据库数据保留）`
 
 type CLI struct {
 	devices      *device.Service

@@ -123,6 +123,11 @@ func (r *Receiver) supervise(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
+		// 旧连接的 Done 与重连请求可能同时就绪；清除旧请求，避免新连接刚建立就被关闭。
+		select {
+		case <-r.reconnect:
+		default:
+		}
 		r.emit(Event{Type: "broker", Status: "connecting"})
 		client, err := r.connect(ctx)
 		if err != nil {
@@ -289,6 +294,8 @@ func (r *Receiver) processDelivery(ctx context.Context, item delivery) {
 }
 
 func isPermanentRejection(err error) bool {
+	// ErrDeviceTransition is intentionally omitted: pending lifecycle operations
+	// must leave QoS 1 deliveries unacknowledged until the database state settles.
 	return errors.Is(err, telemetry.ErrPayloadTooLarge) ||
 		errors.Is(err, telemetry.ErrInvalidMessage) ||
 		errors.Is(err, telemetry.ErrInvalidTopic) ||

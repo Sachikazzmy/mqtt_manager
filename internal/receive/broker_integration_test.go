@@ -115,7 +115,7 @@ func TestBrokerEndToEndDeviceToCLIQueries(t *testing.T) {
 		t.Fatalf("重复消息不应增加历史: 数量=%d err=%v", len(history), err)
 	}
 
-	invalidPayload := []byte(`{"version":"1","device_id":"` + id + `","message_id":"message-invalid","sampled_at":"` + time.Now().UTC().Format(time.RFC3339Nano) + `","metrics":{"temperature":{"value":20,"unit":"kPa"}}}`)
+	invalidPayload := []byte(`{"version":"1","device_id":"` + id + `","message_id":"message-invalid","sampled_at":"` + time.Now().UTC().Format(time.RFC3339Nano) + `","metrics":{"segment-1":{"value":20,"unit":"kPa"}}}`)
 	response, err = integrationPublish(ctx, publisher, "factory/"+id+"/telemetry", invalidPayload)
 	if err != nil || response == nil || response.ReasonCode >= 0x80 {
 		t.Fatalf("格式错误消息未到达业务校验入口: response=%#v err=%v", response, err)
@@ -247,7 +247,7 @@ func integrationPayload(id, messageID string, sampledAt time.Time, value float64
 		MessageID: messageID,
 		SampledAt: sampledAt,
 		Metrics: map[string]telemetry.MetricValue{
-			"temperature": {Value: value, Unit: "C"},
+			"segment-1": {Value: value, Unit: "V"},
 		},
 	})
 	return payload
@@ -290,7 +290,7 @@ func TestIntegrationPublishHelpersHaveStableProtocol(t *testing.T) {
 	if err := json.Unmarshal(value, &message); err != nil {
 		t.Fatal(err)
 	}
-	if message.Version != "1" || message.DeviceID != "device-001" || message.MessageID != "id-1" || message.Metrics["temperature"].Value != 0 {
+	if message.Version != "1" || message.DeviceID != "device-001" || message.MessageID != "id-1" || message.Metrics["segment-1"].Value != 0 {
 		t.Fatalf("集成消息帮助函数协议错误: %s", value)
 	}
 }

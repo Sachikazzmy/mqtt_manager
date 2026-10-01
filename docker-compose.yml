@@ -1,5 +1,5 @@
 x-backend: &backend
-  image: project01-backend:stage3
+  image: project01-backend:stage4
   build: .
   environment:
     MQTT_ADDRESS: broker:8883
@@ -8,10 +8,16 @@ x-backend: &backend
     MQTT_ADMIN_PASSWORD_FILE: /run/secrets/dynsec_admin_password
     MQTT_RECEIVER_PASSWORD_FILE: /run/secrets/mqtt_receiver_password
     MQTT_QUEUE_SIZE: ${MQTT_QUEUE_SIZE:-128}
+    MAX_METRICS_PER_DEVICE: ${MAX_METRICS_PER_DEVICE:-10}
+    MIGRATION_TIMEOUT: ${MIGRATION_TIMEOUT:-15m}
+    DB_HOST: db
+    DB_PASSWORD_FILE: /run/secrets/db_password
+    MIGRATIONS_DIR: /app/migrations
   secrets:
     - dynsec_admin_password
     - mqtt_receiver_password
     - mqtt_ca_cert
+    - db_password
   read_only: true
   tmpfs:
     - /tmp:mode=1777
@@ -21,6 +27,23 @@ x-backend: &backend
     - ALL
 
 services:
+  db:
+    image: postgres:17.6-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: project01
+      POSTGRES_USER: project01
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    secrets:
+      - db_password
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U project01 -d project01"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
   broker:
     image: eclipse-mosquitto:2.1.2-alpine
     restart: unless-stopped
@@ -66,21 +89,31 @@ services:
       MQTT_ADMIN_PASSWORD_FILE: /run/secrets/dynsec_admin_password
       MQTT_RECEIVER_PASSWORD_FILE: /run/secrets/mqtt_receiver_password
       MQTT_QUEUE_SIZE: ${MQTT_QUEUE_SIZE:-128}
+      MAX_METRICS_PER_DEVICE: ${MAX_METRICS_PER_DEVICE:-10}
+      MIGRATION_TIMEOUT: ${MIGRATION_TIMEOUT:-15m}
       MQTT_READINESS_FILE: /tmp/mqtt-ready
+      DB_HOST: db
+      DB_PASSWORD_FILE: /run/secrets/db_password
+      MIGRATIONS_DIR: /app/migrations
     depends_on:
       broker-init:
         condition: service_completed_successfully
+      db:
+        condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "test -f /tmp/mqtt-ready"]
+      test: ["CMD-SHELL", "test -f /tmp/mqtt-ready && test -f /tmp/db-ready"]
       interval: 5s
       timeout: 2s
       retries: 3
-      start_period: 15s
+      start_period: 16m
 
 volumes:
   mosquitto-data:
+  postgres-data:
 
 secrets:
+  db_password:
+    file: ./.secrets/db_password
   dynsec_admin_password:
     file: ./.secrets/dynsec_admin_password
   mosquitto_server_cert:

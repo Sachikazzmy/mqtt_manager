@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"Project/internal/cli"
+	"Project/internal/device"
 	"Project/internal/receive"
 	"Project/internal/telemetry"
 	"github.com/eclipse/paho.golang/packets"
@@ -34,7 +35,7 @@ func run() error {
 	serverName := flag.String("server-name", "localhost", "TLS 证书中的 Broker 名称")
 	caFile := flag.String("ca", ".secrets/mosquitto/ca.crt", "Broker CA PEM 文件")
 	deviceID := flag.String("device", "", "设备编号")
-	metricsArg := flag.String("metrics", "temperature=23.6", "逗号分隔的指标，例如 temperature=23.6,pressure=101.3")
+	metricsArg := flag.String("metrics", "segment-1=23.6:V", "逗号分隔的部分指标，例如 segment-1=23.6:V,segment-2=0:kPa")
 	flag.Parse()
 	if flag.NArg() != 0 {
 		return fmt.Errorf("不接受位置参数")
@@ -133,15 +134,20 @@ func validateDeviceID(value string) error {
 
 func parseMetrics(input string) (map[string]telemetry.MetricValue, error) {
 	metrics := make(map[string]telemetry.MetricValue)
-	units := map[string]string{"temperature": "C", "pressure": "kPa", "current": "A"}
 	for _, part := range strings.Split(input, ",") {
-		name, value, found := strings.Cut(strings.TrimSpace(part), "=")
-		unit, supported := units[name]
-		if !found || !supported || value == "" {
-			return nil, fmt.Errorf("-metrics 仅支持 temperature、pressure、current，格式为 name=value")
+		name, valueAndUnit, found := strings.Cut(strings.TrimSpace(part), "=")
+		if !found || !validMetricKey(name) || valueAndUnit == "" {
+			return nil, fmt.Errorf("-metrics 格式必须为 metric_key=value[:unit]")
 		}
 		if _, exists := metrics[name]; exists {
 			return nil, fmt.Errorf("-metrics 中指标 %q 重复", name)
+		}
+		value, unit, hasUnit := strings.Cut(valueAndUnit, ":")
+		if !hasUnit {
+			return nil, fmt.Errorf("metric_key %q 必须显式提供 unit，格式为 %s=value:unit", name, name)
+		}
+		if unit == "" || len(unit) > 32 {
+			return nil, fmt.Errorf("指标 %q 的 unit 必须为 1 到 32 字节", name)
 		}
 		numeric, err := strconv.ParseFloat(value, 64)
 		if err != nil || math.IsNaN(numeric) || math.IsInf(numeric, 0) {
@@ -153,6 +159,11 @@ func parseMetrics(input string) (map[string]telemetry.MetricValue, error) {
 		return nil, fmt.Errorf("至少提供一个指标")
 	}
 	return metrics, nil
+}
+
+func validMetricKey(key string) bool {
+	_, ok := device.SegmentSlotIndex(key)
+	return ok
 }
 
 func newUUID() (string, error) {

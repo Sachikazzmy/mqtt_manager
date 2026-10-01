@@ -6,9 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
+	"time"
 
 	"Project/internal/cli"
 	"Project/internal/device"
@@ -29,7 +34,23 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	store := storage.NewMemoryStore()
+	metricLimit := device.DefaultMetricLimit
+	if configured := strings.TrimSpace(os.Getenv("MAX_METRICS_PER_DEVICE")); configured != "" {
+		parsed, parseErr := strconv.Atoi(configured)
+		if parseErr != nil {
+			return fmt.Errorf("MAX_METRICS_PER_DEVICE 必须是整数: %w", parseErr)
+		}
+		metricLimit = parsed
+	}
+	if err := device.ValidateMetricLimit(metricLimit); err != nil {
+		return fmt.Errorf("MAX_METRICS_PER_DEVICE 配置无效: %w", err)
+	}
+
+	store, err := openStore(ctx, metricLimit)
+	if err != nil {
+		return err
+	}
+	defer func() { stop(); store.Close() }()
 	telemetryService := telemetry.NewService(store)
 	brokerConfig, configErr := receive.LoadConfigFromEnv()
 	var broker device.BrokerLifecycle
@@ -44,12 +65,17 @@ func run() error {
 		if configErr != nil {
 			broker = receive.NewUnavailableManager(configErr)
 			fmt.Fprintln(os.Stderr, "MQTT 接收器配置失败，CLI 保持运行但 Broker 操作不可用:", configErr)
-		} else {
-			receiver.Start(ctx)
-			defer receiver.Close()
 		}
 	}
 	devices := device.NewManagedService(store, broker)
+	if err := devices.RecoverPending(ctx); err != nil {
+		fmt.Fprintln(os.Stderr, "待完成设备操作暂未恢复，将继续重试:", err)
+	}
+	go monitorDependencies(ctx, store, devices)
+	if receiver != nil {
+		receiver.Start(ctx)
+		defer receiver.Close()
+	}
 	commands := cli.New(devices, telemetryService, os.Stdout, cli.NewTerminalSecretReader(os.Stdout))
 
 	fmt.Println(cli.Help)
@@ -58,6 +84,91 @@ func run() error {
 		return runInput(ctx, stop, commands, nil, nil)
 	}
 	return runInput(ctx, stop, commands, receiver.Events(), receiver.DroppedEvents)
+}
+
+func openStore(ctx context.Context, metricLimit int) (*storage.PostgresStore, error) {
+	migrationTimeout, err := migrationTimeoutFromEnv()
+	if err != nil {
+		return nil, err
+	}
+	passwordFile := os.Getenv("DB_PASSWORD_FILE")
+	if passwordFile == "" {
+		return nil, fmt.Errorf("DB_PASSWORD_FILE 未配置")
+	}
+	password, err := os.ReadFile(passwordFile)
+	if err != nil {
+		return nil, fmt.Errorf("读取数据库密码文件: %w", err)
+	}
+	host := os.Getenv("DB_HOST")
+	if host == "" {
+		host = "db"
+	}
+	port := os.Getenv("DB_PORT")
+	if port == "" {
+		port = "5432"
+	}
+	uri := &url.URL{Scheme: "postgres", Host: net.JoinHostPort(host, port), Path: "/project01", User: url.UserPassword("project01", strings.TrimSpace(string(password)))}
+	uri.RawQuery = "sslmode=disable"
+	deadline := time.NewTimer(60 * time.Second)
+	defer deadline.Stop()
+	for {
+		store, openErr := storage.OpenPostgresWithMetricLimit(ctx, uri.String(), metricLimit)
+		if openErr == nil {
+			migrationDir := os.Getenv("MIGRATIONS_DIR")
+			if migrationDir == "" {
+				migrationDir = "migrations"
+			}
+			if migrateErr := store.MigrateWithTimeout(ctx, migrationDir, migrationTimeout); migrateErr == nil {
+				return store, nil
+			} else {
+				store.Close()
+				return nil, fmt.Errorf("数据库迁移失败: %w", migrateErr)
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-deadline.C:
+			return nil, fmt.Errorf("等待数据库就绪超时: %w", openErr)
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
+func migrationTimeoutFromEnv() (time.Duration, error) {
+	configured := strings.TrimSpace(os.Getenv("MIGRATION_TIMEOUT"))
+	if configured == "" {
+		return storage.DefaultMigrationTimeout, nil
+	}
+	timeout, err := time.ParseDuration(configured)
+	if err != nil {
+		return 0, fmt.Errorf("MIGRATION_TIMEOUT 必须是有效的 Go duration: %w", err)
+	}
+	if timeout <= 0 {
+		return 0, fmt.Errorf("MIGRATION_TIMEOUT 必须大于零")
+	}
+	return timeout, nil
+}
+
+func monitorDependencies(ctx context.Context, store *storage.PostgresStore, devices *device.Service) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for {
+		if err := store.Ping(ctx); err == nil {
+			_ = os.WriteFile("/tmp/db-ready", []byte("ready"), 0600)
+			if err := devices.RecoverPending(ctx); err != nil {
+				fmt.Fprintln(os.Stderr, "设备操作恢复失败，将继续重试:", err)
+			}
+		} else {
+			_ = os.Remove("/tmp/db-ready")
+		}
+		select {
+		case <-ctx.Done():
+			_ = os.Remove("/tmp/db-ready")
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 func runInput(ctx context.Context, stop context.CancelFunc, commands *cli.CLI, events <-chan receive.Event, dropped func() uint64) error {
@@ -245,13 +356,14 @@ func redrawInput(line []byte) {
 }
 
 func removeLastRune(line []byte) []byte {
-	for len(line) > 0 {
-		line = line[:len(line)-1]
-		if len(line) == 0 || line[len(line)]&0xc0 != 0x80 {
-			return line
-		}
+	if len(line) == 0 {
+		return line
 	}
-	return line
+	start := len(line) - 1
+	for start > 0 && line[start]&0xc0 == 0x80 {
+		start--
+	}
+	return line[:start]
 }
 
 func printDroppedEvents(commands *cli.CLI, dropped func() uint64) {

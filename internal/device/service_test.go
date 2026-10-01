@@ -2,8 +2,10 @@ package device_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -94,14 +96,13 @@ func TestManagedEnableKeepsIngressClosedUntilBrokerConfirms(t *testing.T) {
 	receiveTime := time.Date(2026, 9, 29, 4, 15, 30, 0, time.UTC)
 	receiver := telemetry.NewServiceWithClock(store, func() time.Time { return receiveTime }, telemetry.Config{
 		MaxFutureSkew: telemetry.DefaultMaxFutureSkew,
-		MetricRules:   telemetry.DefaultMetricRules(),
 	})
 	var receiveErr error
 	broker.onState = func(ctx context.Context, id string, enabled bool) {
 		if !enabled {
 			return
 		}
-		payload := []byte(fmt.Sprintf(`{"version":"1","device_id":%q,"message_id":"during-enable","sampled_at":%q,"metrics":{"temperature":{"value":23.6,"unit":"C"}}}`, id, receiveTime.Add(-time.Second).Format(time.RFC3339Nano)))
+		payload := []byte(fmt.Sprintf(`{"version":"1","device_id":%q,"message_id":"during-enable","sampled_at":%q,"metrics":{"segment-1":{"value":23.6,"unit":"V"}}}`, id, receiveTime.Add(-time.Second).Format(time.RFC3339Nano)))
 		_, receiveErr = receiver.ReceiveFromBroker(ctx, "factory/"+id+"/telemetry", payload)
 	}
 	broker.stateErr = errors.New("broker enable rejected")
@@ -131,7 +132,7 @@ func TestManagedEnableKeepsIngressClosedUntilBrokerConfirms(t *testing.T) {
 	if err := service.Enable(ctx, "device-001"); err != nil {
 		t.Fatalf("Broker 确认启用后本地提交失败: %v", err)
 	}
-	confirmedPayload := []byte(fmt.Sprintf(`{"version":"1","device_id":"device-001","message_id":"after-enable","sampled_at":%q,"metrics":{"temperature":{"value":23.6,"unit":"C"}}}`, receiveTime.Add(-time.Second).Format(time.RFC3339Nano)))
+	confirmedPayload := []byte(fmt.Sprintf(`{"version":"1","device_id":"device-001","message_id":"after-enable","sampled_at":%q,"metrics":{"segment-1":{"value":23.6,"unit":"V"}}}`, receiveTime.Add(-time.Second).Format(time.RFC3339Nano)))
 	if _, err := receiver.ReceiveFromBroker(ctx, "factory/device-001/telemetry", confirmedPayload); err != nil {
 		t.Fatalf("Broker 确认后本地接收门应开放: %v", err)
 	}
@@ -148,14 +149,13 @@ func TestManagedDisableClosesIngressBeforeBrokerRevocation(t *testing.T) {
 	receiveTime := time.Date(2026, 9, 29, 4, 15, 30, 0, time.UTC)
 	receiver := telemetry.NewServiceWithClock(store, func() time.Time { return receiveTime }, telemetry.Config{
 		MaxFutureSkew: telemetry.DefaultMaxFutureSkew,
-		MetricRules:   telemetry.DefaultMetricRules(),
 	})
 	var receiveErr error
 	broker.onState = func(ctx context.Context, id string, enabled bool) {
 		if enabled {
 			return
 		}
-		payload := []byte(fmt.Sprintf(`{"version":"1","device_id":%q,"message_id":"during-disable","sampled_at":%q,"metrics":{"temperature":{"value":23.6,"unit":"C"}}}`, id, receiveTime.Add(-time.Second).Format(time.RFC3339Nano)))
+		payload := []byte(fmt.Sprintf(`{"version":"1","device_id":%q,"message_id":"during-disable","sampled_at":%q,"metrics":{"segment-1":{"value":23.6,"unit":"V"}}}`, id, receiveTime.Add(-time.Second).Format(time.RFC3339Nano)))
 		_, receiveErr = receiver.ReceiveFromBroker(ctx, "factory/"+id+"/telemetry", payload)
 	}
 	broker.stateErr = errors.New("unexpected group permission")
@@ -261,5 +261,26 @@ func TestDeviceIDRejectsBrokerReservedAndUnsafeCharacters(t *testing.T) {
 		if secret, err := service.Create(context.Background(), id, "test"); !errors.Is(err, device.ErrInvalidID) || secret != "" {
 			t.Errorf("编号 %q 应拒绝: secret=%q err=%v", id, secret, err)
 		}
+	}
+}
+
+func TestNewDeviceHasNoLegacyMetricDefinitionsOrPublicDefinitionField(t *testing.T) {
+	ctx := context.Background()
+	store := storage.NewMemoryStore()
+	service := device.NewService(store)
+	if _, err := service.Create(ctx, "device-001", "test"); err != nil {
+		t.Fatal(err)
+	}
+	d, err := service.Get(ctx, "device-001")
+	if err != nil || len(d.MetricDefinitions) != 0 {
+		t.Fatalf("新设备不应预置默认指标定义: %#v %v", d.MetricDefinitions, err)
+	}
+	encoded, err := json.Marshal(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	public := string(encoded)
+	if strings.Contains(public, "metric_definitions") || strings.Contains(public, "temperature") || strings.Contains(public, "pressure") || strings.Contains(public, "current") {
+		t.Fatalf("设备接口不应暴露默认指标或定义管理字段: %s", public)
 	}
 }

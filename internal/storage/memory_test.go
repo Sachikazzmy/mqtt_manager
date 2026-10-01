@@ -28,7 +28,6 @@ func newTestServices(t *testing.T) (*device.Service, *telemetry.Service, string)
 		return now
 	}, telemetry.Config{
 		MaxFutureSkew: 5 * time.Minute,
-		MetricRules:   telemetry.DefaultMetricRules(),
 	})
 	return devices, telemetryService, secret
 }
@@ -37,7 +36,7 @@ func TestDeleteKeepsHistoryAndPreventsIDReuse(t *testing.T) {
 	ctx := context.Background()
 	devices, telemetryService, secret := newTestServices(t)
 
-	payload := []byte(`{"version":"1","device_id":"device-001","message_id":"m-1","sampled_at":"2026-09-27T11:59:00Z","metrics":{"temperature":{"value":1,"unit":"C"}}}`)
+	payload := []byte(`{"version":"1","device_id":"device-001","message_id":"m-1","sampled_at":"2026-09-27T11:59:00Z","metrics":{"segment-1":{"value":1,"unit":"V"}}}`)
 	if err := telemetryService.Receive(ctx, "device-001", secret, payload); err != nil {
 		t.Fatal(err)
 	}
@@ -59,7 +58,7 @@ func TestDeleteKeepsHistoryAndPreventsIDReuse(t *testing.T) {
 func TestQueryReturnsIndependentSnapshots(t *testing.T) {
 	ctx := context.Background()
 	devices, telemetryService, secret := newTestServices(t)
-	payload := []byte(`{"version":"1","device_id":"device-001","message_id":"m-1","sampled_at":"2026-09-27T11:59:00Z","metrics":{"temperature":{"value":1,"unit":"C"}}}`)
+	payload := []byte(`{"version":"1","device_id":"device-001","message_id":"m-1","sampled_at":"2026-09-27T11:59:00Z","metrics":{"segment-1":{"value":1,"unit":"V"}}}`)
 	if err := telemetryService.Receive(ctx, "device-001", secret, payload); err != nil {
 		t.Fatal(err)
 	}
@@ -68,14 +67,16 @@ func TestQueryReturnsIndependentSnapshots(t *testing.T) {
 		t.Fatal(err)
 	}
 	first.Name = "外部修改"
-	first.Latest.MessageID = "外部修改"
-	first.Latest.Metrics["temperature"] = device.MetricState{Value: 99, Unit: "C"}
+	state := first.Latest.Metrics["segment-1"]
+	state.MessageID = "外部修改"
+	first.Latest.Metrics["segment-1"] = state
+	first.Latest.Metrics["segment-1"] = device.MetricState{Value: 99, Unit: "V"}
 
 	second, err := devices.Get(ctx, "device-001")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if second.Name != "测试设备" || second.Latest.MessageID != "m-1" || second.Latest.Metrics["temperature"].Value != 1 {
+	if second.Name != "测试设备" || second.Latest.Metrics["segment-1"].MessageID != "m-1" || second.Latest.Metrics["segment-1"].Value != 1 {
 		t.Fatalf("设备查询副本污染内部状态: name=%q latest=%#v", second.Name, second.Latest)
 	}
 
@@ -86,7 +87,7 @@ func TestQueryReturnsIndependentSnapshots(t *testing.T) {
 	if len(history) != 1 {
 		t.Fatalf("历史记录数量 = %d，期望 1", len(history))
 	}
-	history[0].Metrics["temperature"] = telemetry.MetricValue{Value: 88, Unit: "C"}
+	history[0].Metrics["segment-1"] = telemetry.MetricValue{Value: 88, Unit: "V"}
 	nextHistory, err := telemetryService.History(ctx, telemetry.HistoryQuery{DeviceID: "device-001", Limit: 10})
 	if err != nil {
 		t.Fatal(err)
@@ -94,7 +95,7 @@ func TestQueryReturnsIndependentSnapshots(t *testing.T) {
 	if len(nextHistory) != 1 {
 		t.Fatalf("再次查询历史记录数量 = %d，期望 1", len(nextHistory))
 	}
-	if nextHistory[0].Metrics["temperature"].Value != 1 {
+	if nextHistory[0].Metrics["segment-1"].Value != 1 {
 		t.Fatalf("历史查询副本污染内部状态: %#v", nextHistory)
 	}
 }
@@ -102,7 +103,7 @@ func TestQueryReturnsIndependentSnapshots(t *testing.T) {
 func TestConfigUpdatesPreserveLatestState(t *testing.T) {
 	ctx := context.Background()
 	devices, telemetryService, secret := newTestServices(t)
-	payload := []byte(`{"version":"1","device_id":"device-001","message_id":"m-1","sampled_at":"2026-09-27T11:59:00Z","metrics":{"temperature":{"value":1,"unit":"C"}}}`)
+	payload := []byte(`{"version":"1","device_id":"device-001","message_id":"m-1","sampled_at":"2026-09-27T11:59:00Z","metrics":{"segment-1":{"value":1,"unit":"V"}}}`)
 	if err := telemetryService.Receive(ctx, "device-001", secret, payload); err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +120,7 @@ func TestConfigUpdatesPreserveLatestState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if d.Name != "新名称" || d.Latest == nil || d.Latest.MessageID != "m-1" || d.Latest.Metrics["temperature"].Value != 1 {
+	if d.Name != "新名称" || d.Latest == nil || d.Latest.Metrics["segment-1"].MessageID != "m-1" || d.Latest.Metrics["segment-1"].Value != 1 {
 		t.Fatalf("配置修改覆盖了 Latest: %#v", d)
 	}
 
@@ -135,7 +136,7 @@ func TestConfigUpdatesPreserveLatestState(t *testing.T) {
 func TestConcurrentConfigUpdatesPreserveLatestState(t *testing.T) {
 	ctx := context.Background()
 	devices, telemetryService, secret := newTestServices(t)
-	payload := []byte(`{"version":"1","device_id":"device-001","message_id":"m-1","sampled_at":"2026-09-27T11:59:00Z","metrics":{"temperature":{"value":1,"unit":"C"}}}`)
+	payload := []byte(`{"version":"1","device_id":"device-001","message_id":"m-1","sampled_at":"2026-09-27T11:59:00Z","metrics":{"segment-1":{"value":1,"unit":"V"}}}`)
 	if err := telemetryService.Receive(ctx, "device-001", secret, payload); err != nil {
 		t.Fatal(err)
 	}
@@ -170,7 +171,7 @@ func TestConcurrentConfigUpdatesPreserveLatestState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if d.Latest == nil || d.Latest.MessageID != "m-1" || d.Latest.Metrics["temperature"].Value != 1 {
+	if d.Latest == nil || d.Latest.Metrics["segment-1"].MessageID != "m-1" || d.Latest.Metrics["segment-1"].Value != 1 {
 		t.Fatalf("并发配置更新覆盖了 Latest: %#v", d.Latest)
 	}
 }
@@ -179,7 +180,7 @@ func TestHistoryFiltersRangeAndLimit(t *testing.T) {
 	ctx := context.Background()
 	_, telemetryService, secret := newTestServices(t)
 	for i, sampledAt := range []string{"2026-09-27T11:00:00Z", "2026-09-27T11:01:00Z", "2026-09-27T11:02:00Z"} {
-		payload := []byte(`{"version":"1","device_id":"device-001","message_id":"m-` + string(rune('1'+i)) + `","sampled_at":"` + sampledAt + `","metrics":{"temperature":{"value":1,"unit":"C"}}}`)
+		payload := []byte(`{"version":"1","device_id":"device-001","message_id":"m-` + string(rune('1'+i)) + `","sampled_at":"` + sampledAt + `","metrics":{"segment-1":{"value":1,"unit":"V"}}}`)
 		if err := telemetryService.Receive(ctx, "device-001", secret, payload); err != nil {
 			t.Fatal(err)
 		}

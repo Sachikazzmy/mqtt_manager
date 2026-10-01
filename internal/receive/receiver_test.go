@@ -54,6 +54,20 @@ func (transientRepository) History(context.Context, telemetry.HistoryQuery) ([]t
 	return nil, errors.New("temporary storage failure")
 }
 
+type transitionRepository struct{}
+
+func (transitionRepository) Commit(context.Context, string, string, telemetry.Sample) error {
+	return telemetry.ErrDeviceTransition
+}
+
+func (transitionRepository) CommitFromBroker(context.Context, string, telemetry.Sample) error {
+	return telemetry.ErrDeviceTransition
+}
+
+func (transitionRepository) History(context.Context, telemetry.HistoryQuery) ([]telemetry.Sample, error) {
+	return nil, telemetry.ErrDeviceTransition
+}
+
 func receiverTestServices(t *testing.T) (*device.Service, *telemetry.Service, string) {
 	t.Helper()
 	store := storage.NewMemoryStore()
@@ -65,7 +79,6 @@ func receiverTestServices(t *testing.T) (*device.Service, *telemetry.Service, st
 	now := time.Date(2026, 9, 27, 12, 0, 0, 0, time.UTC)
 	service := telemetry.NewServiceWithClock(store, func() time.Time { return now }, telemetry.Config{
 		MaxFutureSkew: 5 * time.Minute,
-		MetricRules:   telemetry.DefaultMetricRules(),
 	})
 	return devices, service, secret
 }
@@ -77,7 +90,7 @@ func receiverTestPayload(messageID string) []byte {
 		MessageID: messageID,
 		SampledAt: time.Date(2026, 9, 27, 11, 59, 0, 0, time.UTC),
 		Metrics: map[string]telemetry.MetricValue{
-			"temperature": {Value: 0, Unit: "C"},
+			"segment-1": {Value: 0, Unit: "V"},
 		},
 	})
 	return value
@@ -111,7 +124,7 @@ func TestProcessDeliveryAcknowledgesOnlyAfterStorageCommit(t *testing.T) {
 		t.Fatal("成功存储后没有 MQTT ACK")
 	}
 	event := <-receiver.Events()
-	if event.Type != "accepted" || event.DeviceID != "device-001" || event.MessageID != "received" || event.Metrics["temperature"].Value != 0 {
+	if event.Type != "accepted" || event.DeviceID != "device-001" || event.MessageID != "received" || event.Metrics["segment-1"].Value != 0 {
 		t.Fatalf("接收事件 = %#v", event)
 	}
 }
@@ -128,10 +141,11 @@ func TestProcessDeliveryClassifiesDuplicateRetainedAndRejected(t *testing.T) {
 	receiver.processDelivery(ctx, delivery{packet: &paho.Publish{Topic: "factory/device-001/telemetry", Payload: first, QoS: 1}, ack: ack})
 	receiver.processDelivery(ctx, delivery{packet: &paho.Publish{Topic: "factory/device-001/telemetry", Payload: receiverTestPayload("retained"), QoS: 1, Retain: true}, ack: ack})
 	receiver.processDelivery(ctx, delivery{packet: &paho.Publish{Topic: "factory/device-001/telemetry", Payload: []byte("{}"), QoS: 1}, ack: ack})
-	if acknowledgements != 3 {
+	receiver.processDelivery(ctx, delivery{packet: &paho.Publish{Topic: "factory/device-001/telemetry", Payload: receiverTestPayload("bad\x00id"), QoS: 1}, ack: ack})
+	if acknowledgements != 4 {
 		t.Fatalf("重复、retained 和永久拒收消息都应确认，ACK 数=%d", acknowledgements)
 	}
-	for _, expected := range []string{"duplicate", "reject", "reject"} {
+	for _, expected := range []string{"duplicate", "reject", "reject", "reject"} {
 		if event := <-receiver.Events(); event.Type != expected {
 			t.Fatalf("事件类型=%q，期望=%q: %#v", event.Type, expected, event)
 		}
@@ -146,7 +160,6 @@ func TestProcessDeliveryLeavesTransientAndCanceledMessagesUnacknowledged(t *test
 	now := time.Date(2026, 9, 27, 12, 0, 0, 0, time.UTC)
 	service := telemetry.NewServiceWithClock(transientRepository{}, func() time.Time { return now }, telemetry.Config{
 		MaxFutureSkew: 5 * time.Minute,
-		MetricRules:   telemetry.DefaultMetricRules(),
 	})
 	receiver, err := NewReceiver(Config{QueueSize: 4}, service)
 	if err != nil {
@@ -172,6 +185,30 @@ func TestProcessDeliveryLeavesTransientAndCanceledMessagesUnacknowledged(t *test
 	receiver.processDelivery(canceled, item)
 	if acknowledgements != 0 {
 		t.Fatalf("退出期间不得确认未处理消息，实际=%d", acknowledgements)
+	}
+}
+
+func TestProcessDeliveryRetriesLifecycleTransitionWithoutAcknowledging(t *testing.T) {
+	now := time.Date(2026, 9, 27, 12, 0, 0, 0, time.UTC)
+	service := telemetry.NewServiceWithClock(transitionRepository{}, func() time.Time { return now }, telemetry.Config{
+		MaxFutureSkew: 5 * time.Minute,
+	})
+	receiver, err := NewReceiver(Config{QueueSize: 4}, service)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acknowledgements := 0
+	disconnected := false
+	receiver.processDelivery(context.Background(), delivery{
+		packet:     &paho.Publish{Topic: "factory/device-001/telemetry", Payload: receiverTestPayload("transition"), QoS: 1},
+		ack:        func() error { acknowledgements++; return nil },
+		disconnect: func() { disconnected = true },
+	})
+	if acknowledgements != 0 || !disconnected {
+		t.Fatalf("生命周期过渡期间必须保持未 ACK 并触发重投: ack=%d disconnected=%v", acknowledgements, disconnected)
+	}
+	if event := <-receiver.Events(); event.Type != "retry" {
+		t.Fatalf("生命周期过渡事件应可重试: %#v", event)
 	}
 }
 

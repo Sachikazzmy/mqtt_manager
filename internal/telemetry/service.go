@@ -10,6 +10,9 @@ import (
 	"math"
 	"strings"
 	"time"
+	"unicode/utf8"
+
+	"Project/internal/device"
 )
 
 const (
@@ -20,7 +23,7 @@ const (
 	maxMessageIDBytes  = 128
 	maxMetricNameBytes = 64
 	maxMetricUnitBytes = 32
-	maxMetricCount     = 64
+	maxMetricCount     = device.HardMaxMetricLimit
 
 	DefaultMaxFutureSkew = 5 * time.Minute
 	MaxHistoryLimit      = 1000
@@ -38,28 +41,19 @@ var (
 	ErrHistoryWindow   = errors.New("历史查询时间范围无效")
 )
 
-type MetricRule struct {
-	Unit string
-	Min  *float64
-	Max  *float64
-}
-
 type Config struct {
 	MaxFutureSkew time.Duration
-	MetricRules   map[string]MetricRule
 }
 
 type Service struct {
 	repo          Repository
 	now           func() time.Time
 	maxFutureSkew time.Duration
-	metricRules   map[string]MetricRule
 }
 
 func NewService(repo Repository) *Service {
 	return NewServiceWithConfig(repo, Config{
 		MaxFutureSkew: DefaultMaxFutureSkew,
-		MetricRules:   DefaultMetricRules(),
 	})
 }
 
@@ -67,18 +61,10 @@ func NewServiceWithConfig(repo Repository, config Config) *Service {
 	if config.MaxFutureSkew < 0 {
 		config.MaxFutureSkew = DefaultMaxFutureSkew
 	}
-	if config.MetricRules == nil {
-		config.MetricRules = DefaultMetricRules()
-	}
-	rules := make(map[string]MetricRule, len(config.MetricRules))
-	for name, rule := range config.MetricRules {
-		rules[name] = rule
-	}
 	return &Service{
 		repo:          repo,
 		now:           time.Now,
 		maxFutureSkew: config.MaxFutureSkew,
-		metricRules:   rules,
 	}
 }
 
@@ -89,30 +75,112 @@ func NewServiceWithClock(repo Repository, now func() time.Time, config Config) *
 	return service
 }
 
-func DefaultMetricRules() map[string]MetricRule {
-	return map[string]MetricRule{
-		"temperature": {Unit: "C"},
-		"pressure":    {Unit: "kPa"},
-		"current":     {Unit: "A"},
-	}
-}
-
 func parseMessage(payload []byte) (Message, error) {
+	if !utf8.Valid(payload) {
+		return Message{}, fmt.Errorf("%w：JSON 载荷必须是有效 UTF-8", ErrInvalidMessage)
+	}
 	decoder := json.NewDecoder(bytes.NewReader(payload))
-	decoder.DisallowUnknownFields()
-
-	var msg Message
-	if err := decoder.Decode(&msg); err != nil {
+	token, err := decoder.Token()
+	if err != nil {
 		return Message{}, fmt.Errorf("%w：JSON 解析失败：%v", ErrInvalidMessage, err)
 	}
-	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+	if delimiter, ok := token.(json.Delim); !ok || delimiter != '{' {
+		return Message{}, fmt.Errorf("%w：顶层必须是 JSON 对象", ErrInvalidMessage)
+	}
+	var envelope Message
+	var rawMetrics json.RawMessage
+	seen := make(map[string]struct{}, 5)
+	for decoder.More() {
+		token, err = decoder.Token()
+		if err != nil {
+			return Message{}, fmt.Errorf("%w：JSON 字段解析失败：%v", ErrInvalidMessage, err)
+		}
+		name, ok := token.(string)
+		if !ok {
+			return Message{}, fmt.Errorf("%w：顶层字段名必须是字符串", ErrInvalidMessage)
+		}
+		if _, duplicate := seen[name]; duplicate {
+			return Message{}, fmt.Errorf("%w：顶层字段 %q 重复", ErrInvalidMessage, name)
+		}
+		seen[name] = struct{}{}
+		switch name {
+		case "version":
+			err = decoder.Decode(&envelope.Version)
+		case "device_id":
+			err = decoder.Decode(&envelope.DeviceID)
+		case "message_id":
+			err = decoder.Decode(&envelope.MessageID)
+		case "sampled_at":
+			err = decoder.Decode(&envelope.SampledAt)
+		case "metrics":
+			err = decoder.Decode(&rawMetrics)
+		default:
+			return Message{}, fmt.Errorf("%w：不支持顶层字段 %q", ErrInvalidMessage, name)
+		}
+		if err != nil {
+			return Message{}, fmt.Errorf("%w：字段 %q 解析失败：%v", ErrInvalidMessage, name, err)
+		}
+	}
+	if _, err = decoder.Token(); err != nil {
+		return Message{}, fmt.Errorf("%w：JSON 对象不完整：%v", ErrInvalidMessage, err)
+	}
+	if err = decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		return Message{}, fmt.Errorf("%w：JSON 只能包含一个对象", ErrInvalidMessage)
 	}
-	return msg, nil
+	metrics, err := parseMetrics(rawMetrics)
+	if err != nil {
+		return Message{}, err
+	}
+	return Message{
+		Version: envelope.Version, DeviceID: envelope.DeviceID, MessageID: envelope.MessageID,
+		SampledAt: envelope.SampledAt, Metrics: metrics,
+	}, nil
+}
+
+func parseMetrics(raw json.RawMessage) (map[string]MetricValue, error) {
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("%w：缺少 metrics 对象", ErrInvalidMessage)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	token, err := decoder.Token()
+	if err != nil {
+		return nil, fmt.Errorf("%w：metrics 解析失败：%v", ErrInvalidMessage, err)
+	}
+	if delimiter, ok := token.(json.Delim); !ok || delimiter != '{' {
+		return nil, fmt.Errorf("%w：metrics 必须是 JSON 对象", ErrInvalidMessage)
+	}
+	metrics := make(map[string]MetricValue)
+	for decoder.More() {
+		token, err = decoder.Token()
+		if err != nil {
+			return nil, fmt.Errorf("%w：metrics 解析失败：%v", ErrInvalidMessage, err)
+		}
+		name, ok := token.(string)
+		if !ok {
+			return nil, fmt.Errorf("%w：metric key 必须是字符串", ErrInvalidMessage)
+		}
+		if _, exists := metrics[name]; exists {
+			return nil, fmt.Errorf("%w：metrics 中 metric_key %q 重复", ErrInvalidMessage, name)
+		}
+		var metric MetricValue
+		if err := decoder.Decode(&metric); err != nil {
+			return nil, fmt.Errorf("%w：metric %q 解析失败：%v", ErrInvalidMessage, name, err)
+		}
+		metrics[name] = metric
+	}
+	if _, err = decoder.Token(); err != nil {
+		return nil, fmt.Errorf("%w：metrics 对象不完整：%v", ErrInvalidMessage, err)
+	}
+	if err = decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("%w：metrics 只能包含一个 JSON 对象", ErrInvalidMessage)
+	}
+	return metrics, nil
 }
 
 func normalizeMessage(msg *Message) error {
-	msg.MessageID = strings.TrimSpace(msg.MessageID)
+	if msg.MessageID != strings.TrimSpace(msg.MessageID) {
+		return fmt.Errorf("%w：message_id 不得包含首尾空白", ErrInvalidMessage)
+	}
 	msg.SampledAt = msg.SampledAt.UTC()
 	if msg.Metrics == nil {
 		return nil
@@ -142,6 +210,9 @@ func (s *Service) validateMessage(msg Message, now time.Time) error {
 	if len(msg.MessageID) > maxMessageIDBytes {
 		return fmt.Errorf("%w：message_id 不能超过 %d 字节", ErrInvalidMessage, maxMessageIDBytes)
 	}
+	if strings.ContainsRune(msg.MessageID, '\x00') {
+		return fmt.Errorf("%w：message_id 不能包含 NUL 字符", ErrInvalidMessage)
+	}
 	if msg.SampledAt.IsZero() {
 		return fmt.Errorf("%w：sampled_at 不能为空或无效", ErrInvalidMessage)
 	}
@@ -162,34 +233,107 @@ func (s *Service) validateMessage(msg Message, now time.Time) error {
 		if len(name) > maxMetricNameBytes {
 			return fmt.Errorf("%w：metric 名称不能超过 %d 字节", ErrInvalidMessage, maxMetricNameBytes)
 		}
-		rule, ok := s.metricRules[name]
-		if !ok {
-			return fmt.Errorf("%w：不支持的 metric %q", ErrInvalidMessage, name)
+		if err := validateMetricKey(name); err != nil {
+			return err
 		}
 		if !metric.valuePresent {
 			return fmt.Errorf("%w：metric %q 缺少 value", ErrInvalidMessage, name)
 		}
-		if !metric.unitPresent || metric.Unit == "" {
+		if !metric.unitPresent || strings.TrimSpace(metric.Unit) == "" {
 			return fmt.Errorf("%w：metric %q 的 unit 不能为空", ErrInvalidMessage, name)
+		}
+		if metric.Unit != strings.TrimSpace(metric.Unit) || strings.ContainsRune(metric.Unit, '\x00') {
+			return fmt.Errorf("%w：metric %q 的 unit 不得含首尾空白或 NUL", ErrInvalidMessage, name)
 		}
 		if len(metric.Unit) > maxMetricUnitBytes {
 			return fmt.Errorf("%w：metric %q 的单位不能超过 %d 字节", ErrInvalidMessage, name, maxMetricUnitBytes)
 		}
-		if metric.Unit != rule.Unit {
-			return fmt.Errorf("%w：metric %q 的 unit 必须为 %q", ErrInvalidMessage, name, rule.Unit)
-		}
 		if math.IsNaN(metric.Value) || math.IsInf(metric.Value, 0) {
 			return fmt.Errorf("%w：metric %q 的数值必须是有限数字", ErrInvalidMessage, name)
-		}
-		if rule.Min != nil && metric.Value < *rule.Min {
-			return fmt.Errorf("%w：metric %q 小于配置的最小值", ErrInvalidMessage, name)
-		}
-		if rule.Max != nil && metric.Value > *rule.Max {
-			return fmt.Errorf("%w：metric %q 大于配置的最大值", ErrInvalidMessage, name)
 		}
 	}
 
 	return nil
+}
+
+func validateMetricKey(key string) error {
+	if key == "" || len(key) > maxMetricNameBytes {
+		return fmt.Errorf("%w：metric_key 必须为 1 到 %d 字节", ErrInvalidMessage, maxMetricNameBytes)
+	}
+	for index, value := range key {
+		allowed := value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' || value >= '0' && value <= '9' || value == '_' || value == '-'
+		if !allowed || index == 0 && !(value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' || value >= '0' && value <= '9') {
+			return fmt.Errorf("%w：metric_key 只允许以字母或数字开头的 ASCII 字母、数字、下划线和连字符", ErrInvalidMessage)
+		}
+	}
+	return nil
+}
+
+// ResolveMetricsAgainstDefinitions 应在仓储锁定设备配置后调用。segment-N 首次合法上报时
+// 自动建立定义并绑定单位；返回值只比输入多出本次新建的 segment 定义。
+func ResolveMetricsAgainstDefinitions(metrics map[string]MetricValue, definitions []device.MetricDefinition, definitionLimit int) ([]device.MetricDefinition, error) {
+	if len(metrics) == 0 {
+		return nil, fmt.Errorf("%w：metrics 不能为空", ErrInvalidMessage)
+	}
+	if err := device.ValidateMetricLimit(definitionLimit); err != nil {
+		return nil, fmt.Errorf("%w：设备指标总数上限无效", ErrInvalidMessage)
+	}
+	if len(metrics) > maxMetricCount {
+		return nil, fmt.Errorf("%w：metrics 不能超过 %d 项", ErrInvalidMessage, maxMetricCount)
+	}
+	byKey := make(map[string]device.MetricDefinition, len(definitions))
+	definitionOrder := append([]device.MetricDefinition(nil), definitions...)
+	for _, definition := range definitions {
+		byKey[definition.Key] = definition
+	}
+	newDefinitions := make([]device.MetricDefinition, 0)
+	for key, metric := range metrics {
+		definition, ok := byKey[key]
+		if !ok {
+			slot, isSegment := device.SegmentSlotIndex(key)
+			if !isSegment || slot > device.HardMaxMetricLimit {
+				return nil, fmt.Errorf("%w：metric_key %q 不属于已登记指标或可用 segment 槽位", ErrInvalidMessage, key)
+			}
+			if len(definitionOrder)+len(newDefinitions) >= definitionLimit {
+				return nil, fmt.Errorf("%w：设备指标数量达到配置上限 %d", ErrInvalidMessage, definitionLimit)
+			}
+			definition = device.MetricDefinition{
+				Key: key, DisplayName: key, Unit: metric.Unit, Enabled: true,
+				DisplayOrder: slot,
+			}
+			newDefinitions = append(newDefinitions, definition)
+			byKey[key] = definition
+		}
+		if !definition.Enabled {
+			return nil, fmt.Errorf("%w：metric_key %q 已停用", ErrInvalidMessage, key)
+		}
+		if metric.Unit != definition.Unit {
+			return nil, fmt.Errorf("%w：metric %q 的 unit 必须为 %q", ErrInvalidMessage, key, definition.Unit)
+		}
+		if math.IsNaN(metric.Value) || math.IsInf(metric.Value, 0) {
+			return nil, fmt.Errorf("%w：metric %q 的数值必须是有限数字", ErrInvalidMessage, key)
+		}
+		if definition.MinValue != nil && metric.Value < *definition.MinValue {
+			return nil, fmt.Errorf("%w：metric %q 小于配置的最小值", ErrInvalidMessage, key)
+		}
+		if definition.MaxValue != nil && metric.Value > *definition.MaxValue {
+			return nil, fmt.Errorf("%w：metric %q 大于配置的最大值", ErrInvalidMessage, key)
+		}
+	}
+	// 已登记且启用的定义，加上总定义上限内尚未创建的 segment，可组成可上报子集。
+	capacity := 0
+	for _, definition := range definitionOrder {
+		if definition.Enabled {
+			capacity++
+		}
+	}
+	capacity += len(newDefinitions)
+	capacity += max(0, definitionLimit-len(definitionOrder)-len(newDefinitions))
+	capacity = min(capacity, definitionLimit)
+	if len(metrics) > capacity {
+		return nil, fmt.Errorf("%w：本条指标数量超过该设备已启用定义数", ErrInvalidMessage)
+	}
+	return append(definitionOrder, newDefinitions...), nil
 }
 
 func validateID(field, id string) error {
@@ -266,7 +410,7 @@ func (s *Service) receive(ctx context.Context, deviceID, secret string, payload 
 		return result, fmt.Errorf("%w：入口=%q payload=%q", ErrDeviceMismatch, deviceID, msg.DeviceID)
 	}
 
-	receivedAt := s.now().UTC()
+	receivedAt := s.now().UTC().Truncate(time.Microsecond)
 	if err := s.validateMessage(msg, receivedAt); err != nil {
 		return result, err
 	}
@@ -277,7 +421,7 @@ func (s *Service) receive(ctx context.Context, deviceID, secret string, payload 
 	sample := Sample{
 		DeviceID:   msg.DeviceID,
 		MessageID:  msg.MessageID,
-		SampledAt:  msg.SampledAt,
+		SampledAt:  msg.SampledAt.Truncate(time.Microsecond),
 		ReceivedAt: receivedAt,
 		Metrics:    cloneMetrics(msg.Metrics),
 	}

@@ -23,21 +23,30 @@ type messageKey struct {
 }
 
 type MemoryStore struct {
-	mu         sync.RWMutex
-	devices    map[string]deviceRecord
-	deletedIDs map[string]struct{}
-	seen       map[messageKey]struct{}
-	history    []telemetry.Sample
+	mu          sync.RWMutex
+	devices     map[string]deviceRecord
+	deletedIDs  map[string]struct{}
+	seen        map[messageKey]struct{}
+	history     []telemetry.Sample
+	metricLimit int
 }
 
 var _ device.Repository = (*MemoryStore)(nil)
 var _ telemetry.Repository = (*MemoryStore)(nil)
 
 func NewMemoryStore() *MemoryStore {
+	return NewMemoryStoreWithMetricLimit(device.DefaultMetricLimit)
+}
+
+func NewMemoryStoreWithMetricLimit(metricLimit int) *MemoryStore {
+	if device.ValidateMetricLimit(metricLimit) != nil {
+		metricLimit = device.DefaultMetricLimit
+	}
 	return &MemoryStore{
-		devices:    make(map[string]deviceRecord),
-		deletedIDs: make(map[string]struct{}),
-		seen:       make(map[messageKey]struct{}),
+		devices:     make(map[string]deviceRecord),
+		deletedIDs:  make(map[string]struct{}),
+		seen:        make(map[messageKey]struct{}),
+		metricLimit: metricLimit,
 	}
 }
 
@@ -73,6 +82,8 @@ func (s *MemoryStore) Create(ctx context.Context, config device.Device, secretDi
 		return device.ErrExists
 	}
 	config.Latest = nil
+	config.LastValidReceivedAt = nil
+	config.MetricDefinitions = nil
 	s.devices[config.ID] = deviceRecord{
 		config:       config,
 		secretDigest: secretDigest,
@@ -230,8 +241,17 @@ func (s *MemoryStore) commit(ctx context.Context, deviceID string, secret *strin
 	if _, duplicate := s.seen[key]; duplicate {
 		return telemetry.ErrDuplicateMessage
 	}
+	definitions, err := telemetry.ResolveMetricsAgainstDefinitions(sample.Metrics, record.config.MetricDefinitions, s.metricLimit)
+	if err != nil {
+		return err
+	}
 
+	sample.SampledAt = sample.SampledAt.UTC().Truncate(time.Microsecond)
+	sample.ReceivedAt = sample.ReceivedAt.UTC().Truncate(time.Microsecond)
 	sample = cloneSample(sample)
+	// 自动建立的 segment 定义、历史、去重键和各项 Latest 在同一临界区内一并提交。
+	record.config.MetricDefinitions = cloneMetricDefinitions(definitions)
+	sortMetricDefinitions(record.config.MetricDefinitions)
 	s.seen[key] = struct{}{}
 	s.history = append(s.history, sample)
 	updateLatest(&record.config, sample)
@@ -341,26 +361,27 @@ func sampleBefore(left, right telemetry.Sample) bool {
 
 func updateLatest(config *device.Device, sample telemetry.Sample) {
 	lastValidReceivedAt := sample.ReceivedAt
-	if config.Latest != nil && config.Latest.LastValidReceivedAt.After(lastValidReceivedAt) {
-		lastValidReceivedAt = config.Latest.LastValidReceivedAt
+	if config.LastValidReceivedAt != nil && config.LastValidReceivedAt.After(lastValidReceivedAt) {
+		lastValidReceivedAt = *config.LastValidReceivedAt
 	}
-
-	if config.Latest != nil && !isNewerSample(sample, config.Latest) {
-		config.Latest.LastValidReceivedAt = lastValidReceivedAt
-		return
+	config.LastValidReceivedAt = &lastValidReceivedAt
+	if config.Latest == nil {
+		config.Latest = &device.LatestState{Metrics: make(map[string]device.MetricState)}
 	}
-
-	config.Latest = &device.LatestState{
-		Metrics:             toMetricStates(sample.Metrics),
-		SampledAt:           sample.SampledAt,
-		ReceivedAt:          sample.ReceivedAt,
-		LastValidReceivedAt: lastValidReceivedAt,
-		MessageID:           sample.MessageID,
+	for key, metric := range sample.Metrics {
+		current, exists := config.Latest.Metrics[key]
+		if exists && !isNewerMetric(sample, current) {
+			continue
+		}
+		config.Latest.Metrics[key] = device.MetricState{
+			Value: metric.Value, Unit: metric.Unit,
+			SampledAt: sample.SampledAt, ReceivedAt: sample.ReceivedAt, MessageID: sample.MessageID,
+		}
 	}
 }
 
 // 决胜顺序固定为采样时间、接收时间、消息 ID，保证同一输入得到稳定结果。
-func isNewerSample(sample telemetry.Sample, current *device.LatestState) bool {
+func isNewerMetric(sample telemetry.Sample, current device.MetricState) bool {
 	if !sample.SampledAt.Equal(current.SampledAt) {
 		return sample.SampledAt.After(current.SampledAt)
 	}
@@ -377,19 +398,13 @@ func newerTime(current, candidate time.Time) time.Time {
 	return current
 }
 
-func toMetricStates(metrics map[string]telemetry.MetricValue) map[string]device.MetricState {
-	if metrics == nil {
-		return nil
-	}
-	cloned := make(map[string]device.MetricState, len(metrics))
-	for name, metric := range metrics {
-		cloned[name] = device.MetricState{Value: metric.Value, Unit: metric.Unit}
-	}
-	return cloned
-}
-
 func cloneDevice(config device.Device) device.Device {
 	config.Latest = cloneLatest(config.Latest)
+	config.MetricDefinitions = cloneMetricDefinitions(config.MetricDefinitions)
+	if config.LastValidReceivedAt != nil {
+		last := *config.LastValidReceivedAt
+		config.LastValidReceivedAt = &last
+	}
 	return config
 }
 
@@ -405,6 +420,36 @@ func cloneLatest(latest *device.LatestState) *device.LatestState {
 		}
 	}
 	return &cloned
+}
+
+func cloneMetricDefinitions(definitions []device.MetricDefinition) []device.MetricDefinition {
+	if definitions == nil {
+		return nil
+	}
+	cloned := make([]device.MetricDefinition, len(definitions))
+	for index, definition := range definitions {
+		cloned[index] = definition
+		cloned[index].MinValue = cloneFloat(definition.MinValue)
+		cloned[index].MaxValue = cloneFloat(definition.MaxValue)
+	}
+	return cloned
+}
+
+func cloneFloat(value *float64) *float64 {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
+}
+
+func sortMetricDefinitions(definitions []device.MetricDefinition) {
+	sort.Slice(definitions, func(i, j int) bool {
+		if definitions[i].DisplayOrder != definitions[j].DisplayOrder {
+			return definitions[i].DisplayOrder < definitions[j].DisplayOrder
+		}
+		return definitions[i].Key < definitions[j].Key
+	})
 }
 
 func cloneSample(sample telemetry.Sample) telemetry.Sample {
