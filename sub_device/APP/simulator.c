@@ -14,6 +14,8 @@ typedef struct {
     double current;
     unsigned int random_state;
     int thermal_zone;
+    int pressure_override;
+    int current_override;
 } simulator_state_t;
 
 static simulator_state_t state;
@@ -99,13 +101,17 @@ int simulator_next(sensor_data_t *data) {
     }
 
     state.sequence++;
-    state.pressure += noise(0.08);
-    state.current += noise(0.04);
+    if (!state.pressure_override) state.pressure += noise(0.08);
+    if (!state.current_override) state.current += noise(0.04);
 
-    if (state.pressure < 100.0) state.pressure = 100.0;
-    if (state.pressure > 103.0) state.pressure = 103.0;
-    if (state.current < 1.0) state.current = 1.0;
-    if (state.current > 3.0) state.current = 3.0;
+    if (!state.pressure_override) {
+        if (state.pressure < 100.0) state.pressure = 100.0;
+        if (state.pressure > 103.0) state.pressure = 103.0;
+    }
+    if (!state.current_override) {
+        if (state.current < 1.0) state.current = 1.0;
+        if (state.current > 3.0) state.current = 3.0;
+    }
 
     if (state.mode == SIM_MODE_TEST) {
         if (state.sequence >= 20 && state.sequence < 30) {
@@ -127,5 +133,41 @@ int simulator_next(sensor_data_t *data) {
     data->pressure = state.pressure;
     data->current = state.current;
     data->sequence = state.sequence;
+    data->event_flags = 0;
+    if (state.mode == SIM_MODE_TEST && state.sequence % 37 == 0) {
+        data->event_flags |= SENSOR_EVENT_INTERRUPT;
+    } else if (state.mode == SIM_MODE_RANDOM && state.sequence % 113 == 0) {
+        data->event_flags |= SENSOR_EVENT_INTERRUPT;
+    }
     return 0;
+}
+
+int simulator_set_metric(const char *metric_key, double value) {
+    if (metric_key == NULL) return -1;
+    if ((strcmp(metric_key, "pressure") == 0 || strcmp(metric_key, "segment-2") == 0)) {
+        state.pressure = value;
+        state.pressure_override = 1;
+        return 0;
+    }
+    if ((strcmp(metric_key, "current") == 0 || strcmp(metric_key, "segment-3") == 0)) {
+        state.current = value;
+        state.current_override = 1;
+        return 0;
+    }
+    return -1;
+}
+
+int simulator_clear_metric(const char *metric_key) {
+    if (metric_key == NULL) return -1;
+    if ((strcmp(metric_key, "pressure") == 0 || strcmp(metric_key, "segment-2") == 0)) {
+        state.pressure = 101.3;
+        state.pressure_override = 0;
+        return 0;
+    }
+    if ((strcmp(metric_key, "current") == 0 || strcmp(metric_key, "segment-3") == 0)) {
+        state.current = 2.5;
+        state.current_override = 0;
+        return 0;
+    }
+    return -1;
 }

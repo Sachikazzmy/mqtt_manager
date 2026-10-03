@@ -11,5 +11,7 @@ typedef enum {
 
 int simulator_init(simulator_mode_t mode);
 int simulator_next(sensor_data_t *data);
+int simulator_set_metric(const char *metric_key, double value);
+int simulator_clear_metric(const char *metric_key);
 
 #endif

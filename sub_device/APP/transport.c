@@ -6,8 +6,8 @@
 #include <stdlib.h>
 
 #define MQTT_URI "wss://mqtt.web4sachika.asia:443/mqtt"
-#define MQTT_TOPIC "factory/device-001/telemetry"
-#define MQTT_CLIENT_ID "device-001"
+#define MQTT_TOPIC "factory/linux-01/telemetry"
+#define MQTT_CLIENT_ID "sensor-linux-01-telemetry"
 
 static const char *default_ca_file(void) {
 #ifdef _WIN32
