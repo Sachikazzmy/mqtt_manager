@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	commandpkg "Project/internal/command"
 	"Project/internal/device"
 	"Project/internal/receive"
 	"Project/internal/telemetry"
@@ -28,20 +29,30 @@ const Help = `命令：
   reset-secret <编号>     重置设备密钥（旧密钥立即失效）
   receive <编号> <文件>   从本地 JSON 文件模拟上报
   history <编号> <数量> [起始时间] [结束时间]
+  set <编号> <指标> <数值> 设置可修改指标的模拟值
+  clear <编号> <指标>     清除模拟覆盖
+  command <编号> <ID>      查询单条命令状态
+  commands <编号> <数量> 查看有限数量的命令历史（1 到 100）
   help                    显示帮助
   quit                    退出服务（数据库数据保留）`
 
 type CLI struct {
 	devices      *device.Service
 	telemetry    *telemetry.Service
+	commands     *commandpkg.Service
 	secretReader SecretReader
 	out          io.Writer
 }
 
-func New(devices *device.Service, telemetryService *telemetry.Service, out io.Writer, secretReader SecretReader) *CLI {
+func New(devices *device.Service, telemetryService *telemetry.Service, out io.Writer, secretReader SecretReader, commandServices ...*commandpkg.Service) *CLI {
+	var commandService *commandpkg.Service
+	if len(commandServices) > 0 {
+		commandService = commandServices[0]
+	}
 	return &CLI{
 		devices:      devices,
 		telemetry:    telemetryService,
+		commands:     commandService,
 		secretReader: secretReader,
 		out:          out,
 	}
@@ -183,6 +194,70 @@ func (c *CLI) Execute(ctx context.Context, line string) (bool, error) {
 		}
 		return false, c.printJSON(samples)
 
+	case "set":
+		fields := strings.Fields(args)
+		if len(fields) != 3 {
+			return false, fmt.Errorf("用法: set <编号> <指标> <数值>")
+		}
+		if c.commands == nil {
+			return false, fmt.Errorf("命令服务未配置")
+		}
+		value, err := strconv.ParseFloat(fields[2], 64)
+		if err != nil {
+			return false, fmt.Errorf("数值必须是有限数字: %w", err)
+		}
+		entry, err := c.commands.SetMetric(ctx, fields[0], fields[1], value)
+		if err != nil {
+			return false, err
+		}
+		return false, c.printJSON(entry)
+
+	case "clear":
+		fields := strings.Fields(args)
+		if len(fields) != 2 {
+			return false, fmt.Errorf("用法: clear <编号> <指标>")
+		}
+		if c.commands == nil {
+			return false, fmt.Errorf("命令服务未配置")
+		}
+		entry, err := c.commands.ClearOverride(ctx, fields[0], fields[1])
+		if err != nil {
+			return false, err
+		}
+		return false, c.printJSON(entry)
+
+	case "command":
+		fields := strings.Fields(args)
+		if len(fields) != 2 {
+			return false, fmt.Errorf("用法: command <编号> <command_id>")
+		}
+		if c.commands == nil {
+			return false, fmt.Errorf("命令服务未配置")
+		}
+		entry, err := c.commands.Get(ctx, fields[0], fields[1])
+		if err != nil {
+			return false, err
+		}
+		return false, c.printJSON(entry)
+
+	case "commands":
+		fields := strings.Fields(args)
+		if len(fields) != 2 {
+			return false, fmt.Errorf("用法: commands <编号> <数量>")
+		}
+		if c.commands == nil {
+			return false, fmt.Errorf("命令服务未配置")
+		}
+		limit, err := strconv.Atoi(fields[1])
+		if err != nil {
+			return false, fmt.Errorf("命令历史数量必须是 1 到 %d 的整数", commandpkg.MaxHistoryLimit)
+		}
+		entries, err := c.commands.History(ctx, fields[0], limit)
+		if err != nil {
+			return false, err
+		}
+		return false, c.printJSON(entries)
+
 	default:
 		return false, fmt.Errorf("未知命令 %q，输入 help 查看帮助", command)
 	}
@@ -256,6 +331,9 @@ func (c *CLI) PrintEvent(event receive.Event) error {
 		return err
 	case "duplicate":
 		_, err := fmt.Fprintf(c.out, "[MQTT] 重复消息 device_id=%s message_id=%s\n", event.DeviceID, event.MessageID)
+		return err
+	case "command_result":
+		_, err := fmt.Fprintf(c.out, "[MQTT] 设备命令结果 device_id=%s command_id=%s status=%s（遥测 Latest 需由后续采样确认）\n", event.DeviceID, event.CommandID, event.CommandStatus)
 		return err
 	case "reject":
 		_, err := fmt.Fprintf(c.out, "[MQTT] 拒收 device_id=%s message_id=%s reason=%s\n", event.DeviceID, event.MessageID, event.Reason)

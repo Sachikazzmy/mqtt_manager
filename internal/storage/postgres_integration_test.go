@@ -171,12 +171,12 @@ func TestPostgresPartialMetricLatestAndHistorySurviveRestart(t *testing.T) {
 	payload := func(messageID, sampledAt, metrics string) []byte {
 		return []byte(fmt.Sprintf(`{"version":"1","device_id":%q,"message_id":%q,"sampled_at":%q,"metrics":%s}`, id, messageID, sampledAt, metrics))
 	}
-	if err = telemetryService.Receive(ctx, id, secret, payload("m-10", "2026-09-27T10:00:00Z", `{"segment-1":{"value":1,"unit":"V"}}`)); err != nil {
+	if err = telemetryService.Receive(ctx, id, secret, payload("m-10", "2026-09-27T10:00:00Z", `{"segment-1":{"value":1,"unit":"V","modifiable":true}}`)); err != nil {
 		store.Close()
 		t.Fatal(err)
 	}
 	clock = time.Date(2026, 9, 27, 11, 0, 5, 0, time.UTC)
-	if err = telemetryService.Receive(ctx, id, secret, payload("m-11", "2026-09-27T11:00:00Z", `{"segment-2":{"value":0,"unit":"kPa"},"segment-3":{"value":3,"unit":"A"}}`)); err != nil {
+	if err = telemetryService.Receive(ctx, id, secret, payload("m-11", "2026-09-27T11:00:00Z", `{"segment-2":{"value":0,"unit":"kPa","modifiable":false},"segment-3":{"value":3,"unit":"A"}}`)); err != nil {
 		store.Close()
 		t.Fatal(err)
 	}
@@ -185,11 +185,11 @@ func TestPostgresPartialMetricLatestAndHistorySurviveRestart(t *testing.T) {
 		store.Close()
 		t.Fatalf("逐指标 Latest 未合并不同消息: %#v %v", d, err)
 	}
-	if state := d.Latest.Metrics["segment-1"]; state.Value != 1 || state.SampledAt.Hour() != 10 || state.MessageID != "m-10" {
+	if state := d.Latest.Metrics["segment-1"]; state.Value != 1 || state.SampledAt.Hour() != 10 || state.MessageID != "m-10" || !state.Modifiable {
 		store.Close()
 		t.Fatalf("未上报指标的采样时间和来源应保持不变: %#v", state)
 	}
-	if state := d.Latest.Metrics["segment-2"]; state.Value != 0 || state.SampledAt.Hour() != 11 || state.MessageID != "m-11" {
+	if state := d.Latest.Metrics["segment-2"]; state.Value != 0 || state.SampledAt.Hour() != 11 || state.MessageID != "m-11" || state.Modifiable {
 		store.Close()
 		t.Fatalf("零值指标状态错误: %#v", state)
 	}
@@ -201,7 +201,7 @@ func TestPostgresPartialMetricLatestAndHistorySurviveRestart(t *testing.T) {
 
 	// 同一多指标消息的并发重投只能有一个事务写历史并更新所有对应 Latest。
 	clock = time.Date(2026, 9, 27, 12, 0, 5, 0, time.UTC)
-	concurrentPayload := payload("m-12", "2026-09-27T12:00:00Z", `{"segment-1":{"value":2,"unit":"V"},"segment-2":{"value":4,"unit":"kPa"}}`)
+	concurrentPayload := payload("m-12", "2026-09-27T12:00:00Z", `{"segment-1":{"value":2,"unit":"V","modifiable":false},"segment-2":{"value":4,"unit":"kPa","modifiable":true}}`)
 	const attempts = 12
 	results := make(chan error, attempts)
 	var group sync.WaitGroup
@@ -281,6 +281,9 @@ func TestPostgresPartialMetricLatestAndHistorySurviveRestart(t *testing.T) {
 	d, err = store.Get(ctx, id)
 	if err != nil || d.Latest == nil || d.Latest.Metrics["segment-1"].MessageID != "m-12" || d.Latest.Metrics["segment-2"].MessageID != "m-12" || d.Latest.Metrics["segment-3"].MessageID != "m-11" {
 		t.Fatalf("重启后每项 Latest 应保留各自来源: %#v %v", d, err)
+	}
+	if d.Latest.Metrics["segment-1"].Modifiable || !d.Latest.Metrics["segment-2"].Modifiable || d.Latest.Metrics["segment-3"].Modifiable {
+		t.Fatalf("重启后 modifiable 必须跟随各自 Latest 来源，旧协议默认为 false: %#v", d.Latest.Metrics)
 	}
 	if state := d.Latest.Metrics["segment-4"]; state.MessageID != acceptedMessage {
 		t.Fatalf("首次单位绑定应与唯一有效 Latest 一致: accepted=%q latest=%#v", acceptedMessage, state)

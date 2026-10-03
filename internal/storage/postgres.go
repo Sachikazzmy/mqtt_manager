@@ -279,7 +279,7 @@ func loadMetricData(ctx context.Context, queryer metricDataQuerier, ids []string
 	}
 	definitionRows.Close()
 
-	latestRows, err := queryer.Query(ctx, `SELECT device_id,metric_key,value,unit,sampled_at,received_at,message_id FROM device_metric_latest WHERE device_id = ANY($1) ORDER BY device_id,metric_key`, ids)
+	latestRows, err := queryer.Query(ctx, `SELECT device_id,metric_key,value,unit,modifiable,sampled_at,received_at,message_id FROM device_metric_latest WHERE device_id = ANY($1) ORDER BY device_id,metric_key`, ids)
 	if err != nil {
 		return err
 	}
@@ -287,7 +287,7 @@ func loadMetricData(ctx context.Context, queryer metricDataQuerier, ids []string
 	for latestRows.Next() {
 		var id, key string
 		var state device.MetricState
-		if err = latestRows.Scan(&id, &key, &state.Value, &state.Unit, &state.SampledAt, &state.ReceivedAt, &state.MessageID); err != nil {
+		if err = latestRows.Scan(&id, &key, &state.Value, &state.Unit, &state.Modifiable, &state.SampledAt, &state.ReceivedAt, &state.MessageID); err != nil {
 			return err
 		}
 		if target := byID[id]; target != nil {
@@ -315,7 +315,24 @@ func (s *PostgresStore) UpdateName(ctx context.Context, id, name string, at time
 	return s.update(ctx, `UPDATE devices SET name=$2,updated_at=GREATEST(updated_at,$3) WHERE id=$1 AND deleted_at IS NULL AND pending_operation IS NULL`, id, name, at)
 }
 func (s *PostgresStore) SetEnabled(ctx context.Context, id string, enabled bool, at time.Time) error {
-	return s.update(ctx, `UPDATE devices SET enabled=$2,updated_at=GREATEST(updated_at,$3) WHERE id=$1 AND deleted_at IS NULL AND pending_operation IS NULL`, id, enabled, at)
+	q, c := bounded(ctx)
+	defer c()
+	tx, err := s.pool.Begin(q)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(q)
+	if _, err = tx.Exec(q, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, id); err != nil {
+		return err
+	}
+	tag, err := tx.Exec(q, `UPDATE devices SET enabled=$2,updated_at=GREATEST(updated_at,$3) WHERE id=$1 AND deleted_at IS NULL AND pending_operation IS NULL`, id, enabled, at)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return device.ErrNotFound
+	}
+	return tx.Commit(q)
 }
 func (s *PostgresStore) ResetSecret(ctx context.Context, id string, digest device.SecretDigest, at time.Time) error {
 	return s.update(ctx, `UPDATE devices SET secret_digest=$2,updated_at=GREATEST(updated_at,$3) WHERE id=$1 AND deleted_at IS NULL AND pending_operation IS NULL`, id, digest[:], at)
@@ -328,6 +345,9 @@ func (s *PostgresStore) Delete(ctx context.Context, id string) error {
 		return err
 	}
 	defer tx.Rollback(q)
+	if _, err = tx.Exec(q, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, id); err != nil {
+		return err
+	}
 	tag, err := tx.Exec(q, `UPDATE devices SET deleted_at=now(),enabled=false,secret_digest=decode(repeat('00',32),'hex'),latest_sampled_at=NULL,latest_received_at=NULL,last_valid_received_at=NULL,latest_message_id=NULL,latest_metrics=NULL WHERE id=$1 AND deleted_at IS NULL AND pending_operation IS NULL`, id)
 	if err != nil {
 		return err
@@ -336,6 +356,10 @@ func (s *PostgresStore) Delete(ctx context.Context, id string) error {
 		return device.ErrNotFound
 	}
 	if _, err = tx.Exec(q, `DELETE FROM device_metric_latest WHERE device_id=$1`, id); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(q, `UPDATE device_commands SET status='cancelled',last_error='设备已删除'
+WHERE device_id=$1 AND status IN ('waiting_to_send','broker_acked','result_unknown')`, id); err != nil {
 		return err
 	}
 	return tx.Commit(q)
@@ -420,12 +444,12 @@ func (s *PostgresStore) commit(ctx context.Context, id string, secret *string, s
 	sort.Strings(keys)
 	for _, key := range keys {
 		metric := sample.Metrics[key]
-		_, e = tx.Exec(q, `INSERT INTO device_metric_latest(device_id,metric_key,value,unit,sampled_at,received_at,message_id)
-VALUES($1,$2,$3,$4,$5,$6,$7)
+		_, e = tx.Exec(q, `INSERT INTO device_metric_latest(device_id,metric_key,value,unit,modifiable,sampled_at,received_at,message_id)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8)
 ON CONFLICT (device_id,metric_key) DO UPDATE SET
- value=EXCLUDED.value,unit=EXCLUDED.unit,sampled_at=EXCLUDED.sampled_at,received_at=EXCLUDED.received_at,message_id=EXCLUDED.message_id
+ value=EXCLUDED.value,unit=EXCLUDED.unit,modifiable=EXCLUDED.modifiable,sampled_at=EXCLUDED.sampled_at,received_at=EXCLUDED.received_at,message_id=EXCLUDED.message_id
 WHERE (device_metric_latest.sampled_at,device_metric_latest.received_at,device_metric_latest.message_id)
-    < (EXCLUDED.sampled_at,EXCLUDED.received_at,EXCLUDED.message_id)`, id, key, metric.Value, metric.Unit, sampled, received, sample.MessageID)
+    < (EXCLUDED.sampled_at,EXCLUDED.received_at,EXCLUDED.message_id)`, id, key, metric.Value, metric.Unit, metric.Modifiable, sampled, received, sample.MessageID)
 		if e != nil {
 			return classifyTelemetryWriteError(e)
 		}

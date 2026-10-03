@@ -9,6 +9,7 @@ import (
 type MetricState struct {
 	Value      float64   `json:"value"`
 	Unit       string    `json:"unit"`
+	Modifiable bool      `json:"modifiable"`
 	SampledAt  time.Time `json:"sampled_at"`
 	ReceivedAt time.Time `json:"received_at"`
 	MessageID  string    `json:"message_id"`

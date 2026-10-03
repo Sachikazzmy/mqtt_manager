@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"Project/internal/cli"
+	"Project/internal/command"
 	"Project/internal/device"
 	"Project/internal/receive"
 	"Project/internal/storage"
@@ -59,24 +60,42 @@ func run() error {
 		broker = receive.NewUnavailableManager(configErr)
 		fmt.Fprintln(os.Stderr, "MQTT 配置不可用，CLI 保持运行但 add/启停/删除/重置不会成功:", configErr)
 	} else {
-		manager := receive.NewManager(brokerConfig)
-		broker = manager
-		receiver, configErr = receive.NewReceiver(brokerConfig, telemetryService)
-		if configErr != nil {
-			broker = receive.NewUnavailableManager(configErr)
-			fmt.Fprintln(os.Stderr, "MQTT 接收器配置失败，CLI 保持运行但 Broker 操作不可用:", configErr)
-		}
+		broker = receive.NewManager(brokerConfig)
 	}
 	devices := device.NewManagedService(store, broker)
 	if err := devices.RecoverPending(ctx); err != nil {
 		fmt.Fprintln(os.Stderr, "待完成设备操作暂未恢复，将继续重试:", err)
 	}
-	go monitorDependencies(ctx, store, devices)
+	commandService := command.NewService(devices, store)
+	if configErr == nil {
+		receiver, configErr = receive.NewReceiver(brokerConfig, telemetryService, commandService)
+		if configErr != nil {
+			fmt.Fprintln(os.Stderr, "MQTT 接收器配置失败；命令将持久化但不会发布:", configErr)
+		}
+	}
+	var aclUpgrader interface {
+		UpgradeReceiverACL(context.Context) error
+		UpgradeDeviceACL(context.Context, string) error
+	}
+	aclUpgradePending := false
+	if receiver != nil {
+		aclUpgrader, _ = broker.(interface {
+			UpgradeReceiverACL(context.Context) error
+			UpgradeDeviceACL(context.Context, string) error
+		})
+		if aclUpgrader != nil {
+			aclUpgradePending = upgradeBrokerACLs(ctx, devices, aclUpgrader) != nil
+		}
+	}
+	go monitorDependencies(ctx, store, devices, aclUpgrader, aclUpgradePending)
 	if receiver != nil {
 		receiver.Start(ctx)
 		defer receiver.Close()
+		go commandService.Run(ctx, receiver)
+	} else {
+		go commandService.Run(ctx, unavailableCommandPublisher{})
 	}
-	commands := cli.New(devices, telemetryService, os.Stdout, cli.NewTerminalSecretReader(os.Stdout))
+	commands := cli.New(devices, telemetryService, os.Stdout, cli.NewTerminalSecretReader(os.Stdout), commandService)
 
 	fmt.Println(cli.Help)
 	if receiver == nil {
@@ -84,6 +103,12 @@ func run() error {
 		return runInput(ctx, stop, commands, nil, nil)
 	}
 	return runInput(ctx, stop, commands, receiver.Events(), receiver.DroppedEvents)
+}
+
+type unavailableCommandPublisher struct{}
+
+func (unavailableCommandPublisher) PublishCommand(context.Context, string, []byte) error {
+	return receive.ErrBrokerUnavailable
 }
 
 func openStore(ctx context.Context, metricLimit int) (*storage.PostgresStore, error) {
@@ -150,7 +175,10 @@ func migrationTimeoutFromEnv() (time.Duration, error) {
 	return timeout, nil
 }
 
-func monitorDependencies(ctx context.Context, store *storage.PostgresStore, devices *device.Service) {
+func monitorDependencies(ctx context.Context, store *storage.PostgresStore, devices *device.Service, aclUpgrader interface {
+	UpgradeReceiverACL(context.Context) error
+	UpgradeDeviceACL(context.Context, string) error
+}, aclUpgradePending bool) {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -158,6 +186,9 @@ func monitorDependencies(ctx context.Context, store *storage.PostgresStore, devi
 			_ = os.WriteFile("/tmp/db-ready", []byte("ready"), 0600)
 			if err := devices.RecoverPending(ctx); err != nil {
 				fmt.Fprintln(os.Stderr, "设备操作恢复失败，将继续重试:", err)
+			}
+			if aclUpgradePending && aclUpgrader != nil && upgradeBrokerACLs(ctx, devices, aclUpgrader) == nil {
+				aclUpgradePending = false
 			}
 		} else {
 			_ = os.Remove("/tmp/db-ready")
@@ -169,6 +200,29 @@ func monitorDependencies(ctx context.Context, store *storage.PostgresStore, devi
 		case <-ticker.C:
 		}
 	}
+}
+
+func upgradeBrokerACLs(ctx context.Context, devices *device.Service, upgrader interface {
+	UpgradeReceiverACL(context.Context) error
+	UpgradeDeviceACL(context.Context, string) error
+}) error {
+	var failures []error
+	if err := upgrader.UpgradeReceiverACL(ctx); err != nil {
+		fmt.Fprintln(os.Stderr, "后端业务账户 Broker ACL 升级失败；账户密钥和启用状态未更改，将继续重试:", err)
+		failures = append(failures, err)
+	}
+	registered, err := devices.List(ctx)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "读取设备列表以升级命令 ACL 失败，将继续重试:", err)
+		return errors.Join(append(failures, err)...)
+	}
+	for _, registeredDevice := range registered {
+		if upgradeErr := upgrader.UpgradeDeviceACL(ctx, registeredDevice.ID); upgradeErr != nil {
+			fmt.Fprintf(os.Stderr, "设备 %s 的 Broker ACL 升级失败；设备密钥、账户和启用状态未更改，将继续重试: %v\n", registeredDevice.ID, upgradeErr)
+			failures = append(failures, upgradeErr)
+		}
+	}
+	return errors.Join(failures...)
 }
 
 func runInput(ctx context.Context, stop context.CancelFunc, commands *cli.CLI, events <-chan receive.Event, dropped func() uint64) error {

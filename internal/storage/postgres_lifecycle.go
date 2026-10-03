@@ -38,7 +38,15 @@ func (s *PostgresStore) BeginOperation(ctx context.Context, id, operation string
 	}
 	q, c := bounded(ctx)
 	defer c()
-	tag, err := s.pool.Exec(q, `UPDATE devices SET enabled=false,pending_operation=$2,updated_at=GREATEST(updated_at,$3) WHERE id=$1 AND deleted_at IS NULL AND pending_operation IS NULL AND ($2 <> 'enable' OR NOT requires_secret_reset)`, id, operation, at)
+	tx, err := s.pool.Begin(q)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(q)
+	if _, err = tx.Exec(q, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, id); err != nil {
+		return err
+	}
+	tag, err := tx.Exec(q, `UPDATE devices SET enabled=false,pending_operation=$2,updated_at=GREATEST(updated_at,$3) WHERE id=$1 AND deleted_at IS NULL AND pending_operation IS NULL AND ($2 <> 'enable' OR NOT requires_secret_reset)`, id, operation, at)
 	if err != nil {
 		return err
 	}
@@ -46,7 +54,7 @@ func (s *PostgresStore) BeginOperation(ctx context.Context, id, operation string
 		if operation == "enable" {
 			var resetRequired bool
 			var pending *string
-			checkErr := s.pool.QueryRow(q, `SELECT requires_secret_reset,pending_operation FROM devices WHERE id=$1 AND deleted_at IS NULL`, id).Scan(&resetRequired, &pending)
+			checkErr := tx.QueryRow(q, `SELECT requires_secret_reset,pending_operation FROM devices WHERE id=$1 AND deleted_at IS NULL`, id).Scan(&resetRequired, &pending)
 			if checkErr == nil && pending == nil && resetRequired {
 				return device.ErrSecretResetRequired
 			}
@@ -56,7 +64,7 @@ func (s *PostgresStore) BeginOperation(ctx context.Context, id, operation string
 		}
 		return device.ErrPendingOrNotFound
 	}
-	return nil
+	return tx.Commit(q)
 }
 func (s *PostgresStore) FinishOperation(ctx context.Context, id, operation string, digest *device.SecretDigest, enabled bool, at time.Time) error {
 	q, c := bounded(ctx)
@@ -75,6 +83,10 @@ func (s *PostgresStore) FinishOperation(ctx context.Context, id, operation strin
 		tag, err = tx.Exec(q, `UPDATE devices SET deleted_at=$3,enabled=false,pending_operation=NULL,secret_digest=decode(repeat('00',32),'hex'),latest_sampled_at=NULL,latest_received_at=NULL,last_valid_received_at=NULL,latest_message_id=NULL,latest_metrics=NULL WHERE id=$1 AND pending_operation=$2 AND deleted_at IS NULL`, id, expected, at)
 		if err == nil && tag.RowsAffected() > 0 {
 			_, err = tx.Exec(q, `DELETE FROM device_metric_latest WHERE device_id=$1`, id)
+		}
+		if err == nil && tag.RowsAffected() > 0 {
+			_, err = tx.Exec(q, `UPDATE device_commands SET status='cancelled',last_error='设备已删除'
+WHERE device_id=$1 AND status IN ('waiting_to_send','broker_acked','result_unknown')`, id)
 		}
 	} else {
 		var digestBytes []byte

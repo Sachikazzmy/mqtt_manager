@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"Project/internal/command"
 	"Project/internal/device"
 	"Project/internal/storage"
 	"Project/internal/telemetry"
@@ -126,6 +127,107 @@ func TestProcessDeliveryAcknowledgesOnlyAfterStorageCommit(t *testing.T) {
 	event := <-receiver.Events()
 	if event.Type != "accepted" || event.DeviceID != "device-001" || event.MessageID != "received" || event.Metrics["segment-1"].Value != 0 {
 		t.Fatalf("接收事件 = %#v", event)
+	}
+}
+
+func TestCommandResultIsRoutedAndAcknowledgedAfterCommandCommit(t *testing.T) {
+	ctx := context.Background()
+	store := storage.NewMemoryStore()
+	devices := device.NewService(store)
+	secret, err := devices.Create(ctx, "linux-01", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 30, 4, 1, 0, 0, time.UTC)
+	telemetryService := telemetry.NewServiceWithClock(store, func() time.Time { return now }, telemetry.Config{MaxFutureSkew: 5 * time.Minute})
+	telemetryPayload := []byte(`{"version":"1","device_id":"linux-01","message_id":"telemetry-1","sampled_at":"2026-09-30T04:00:00Z","metrics":{"segment-1":{"value":23.6,"unit":"V","modifiable":true}}}`)
+	if err := telemetryService.Receive(ctx, "linux-01", secret, telemetryPayload); err != nil {
+		t.Fatal(err)
+	}
+	commandService := command.NewService(devices, store)
+	entry, err := commandService.SetMetric(ctx, "linux-01", "segment-1", 120)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiver, err := NewReceiver(Config{QueueSize: 4}, telemetryService, commandService)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := []byte(`{"version":"1","command_id":"` + entry.CommandID + `","status":"applied","metric_key":"segment-1","value":120}`)
+	acked := false
+	receiver.processDelivery(ctx, delivery{
+		packet: &paho.Publish{Topic: "factory/linux-01/command_result", Payload: result, QoS: 1},
+		ack: func() error {
+			acked = true
+			stored, getErr := commandService.Get(ctx, "linux-01", entry.CommandID)
+			if getErr != nil || stored.Status != command.StatusApplied || stored.ResultReceivedAt == nil {
+				t.Fatalf("ACK 前命令结果必须已提交: %#v %v", stored, getErr)
+			}
+			return nil
+		},
+	})
+	if !acked {
+		t.Fatal("有效 command_result 未 ACK")
+	}
+	event := <-receiver.Events()
+	if event.Type != "command_result" || event.CommandID != entry.CommandID || event.CommandStatus != command.StatusApplied {
+		t.Fatalf("结果事件 = %#v", event)
+	}
+	history, err := telemetryService.History(ctx, telemetry.HistoryQuery{DeviceID: "linux-01", Limit: 10})
+	deviceValue, getErr := devices.Get(ctx, "linux-01")
+	if err != nil || len(history) != 1 || getErr != nil || deviceValue.Latest.Metrics["segment-1"].Value != 23.6 {
+		t.Fatalf("命令结果不得交给遥测解析器或修改 Latest: history=%#v latest=%#v err=%v/%v", history, deviceValue.Latest, err, getErr)
+	}
+}
+
+type commandResultErrorRepository struct {
+	command.Repository
+	err error
+}
+
+func (r commandResultErrorRepository) ProcessResult(context.Context, string, command.Result, []byte, time.Time) (command.Disposition, error) {
+	return command.Disposition{}, r.err
+}
+
+func TestCommandResultDuringDeviceTransitionIsNotAcknowledged(t *testing.T) {
+	ctx := context.Background()
+	store := storage.NewMemoryStore()
+	devices := device.NewService(store)
+	secret, err := devices.Create(ctx, "linux-01", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	telemetryService := telemetry.NewService(store)
+	telemetryPayload := []byte(`{"version":"1","device_id":"linux-01","message_id":"telemetry-1","sampled_at":"2026-09-30T04:00:00Z","metrics":{"segment-1":{"value":23.6,"unit":"V","modifiable":true}}}`)
+	if err := telemetryService.Receive(ctx, "linux-01", secret, telemetryPayload); err != nil {
+		t.Fatal(err)
+	}
+	baseRepository := command.Repository(store)
+	commands := command.NewService(devices, commandResultErrorRepository{Repository: baseRepository, err: command.ErrDeviceTransition})
+	entry, err := commands.SetMetric(ctx, "linux-01", "segment-1", 120)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiver, err := NewReceiver(Config{QueueSize: 4}, telemetryService, commands)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acked := false
+	receiver.processDelivery(ctx, delivery{
+		packet:     &paho.Publish{Topic: "factory/linux-01/command_result", Payload: []byte(`{"version":"1","command_id":"` + entry.CommandID + `","status":"applied","metric_key":"segment-1","value":120}`), QoS: 1},
+		ack:        func() error { acked = true; return nil },
+		disconnect: func() {},
+	})
+	if acked {
+		t.Fatal("设备生命周期过渡时结果不可 ACK，应等待重投")
+	}
+	if event := <-receiver.Events(); event.Type != "retry" {
+		t.Fatalf("过渡结果应进入重试分支: %#v", event)
+	}
+	select {
+	case <-receiver.reconnect:
+	default:
+		t.Fatal("设备生命周期过渡应触发连接恢复以重投结果")
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"Project/internal/command"
 	"Project/internal/device"
 	"Project/internal/telemetry"
 )
@@ -22,12 +23,19 @@ type messageKey struct {
 	messageID string
 }
 
+type commandKey struct {
+	deviceID  string
+	commandID string
+}
+
 type MemoryStore struct {
 	mu          sync.RWMutex
 	devices     map[string]deviceRecord
 	deletedIDs  map[string]struct{}
 	seen        map[messageKey]struct{}
 	history     []telemetry.Sample
+	commands    map[commandKey]command.Command
+	anomalies   []string
 	metricLimit int
 }
 
@@ -46,6 +54,7 @@ func NewMemoryStoreWithMetricLimit(metricLimit int) *MemoryStore {
 		devices:     make(map[string]deviceRecord),
 		deletedIDs:  make(map[string]struct{}),
 		seen:        make(map[messageKey]struct{}),
+		commands:    make(map[commandKey]command.Command),
 		metricLimit: metricLimit,
 	}
 }
@@ -197,6 +206,13 @@ func (s *MemoryStore) Delete(ctx context.Context, id string) error {
 	}
 	delete(s.devices, id)
 	s.deletedIDs[id] = struct{}{}
+	for key, entry := range s.commands {
+		if key.deviceID == id && (entry.Status == command.StatusWaitingToSend || entry.Status == command.StatusBrokerAcked || entry.Status == command.StatusResultUnknown) {
+			entry.Status = command.StatusCancelled
+			entry.LastError = "设备已删除"
+			s.commands[key] = entry
+		}
+	}
 	return nil
 }
 
@@ -374,7 +390,7 @@ func updateLatest(config *device.Device, sample telemetry.Sample) {
 			continue
 		}
 		config.Latest.Metrics[key] = device.MetricState{
-			Value: metric.Value, Unit: metric.Unit,
+			Value: metric.Value, Unit: metric.Unit, Modifiable: metric.Modifiable,
 			SampledAt: sample.SampledAt, ReceivedAt: sample.ReceivedAt, MessageID: sample.MessageID,
 		}
 	}

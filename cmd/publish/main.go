@@ -36,6 +36,7 @@ func run() error {
 	caFile := flag.String("ca", ".secrets/mosquitto/ca.crt", "Broker CA PEM 文件")
 	deviceID := flag.String("device", "", "设备编号")
 	metricsArg := flag.String("metrics", "segment-1=23.6:V", "逗号分隔的部分指标，例如 segment-1=23.6:V,segment-2=0:kPa")
+	modifiableArg := flag.String("modifiable", "", "逗号分隔的可修改指标 key，例如 segment-1；默认所有指标不可修改")
 	flag.Parse()
 	if flag.NArg() != 0 {
 		return fmt.Errorf("不接受位置参数")
@@ -45,6 +46,9 @@ func run() error {
 	}
 	metrics, err := parseMetrics(*metricsArg)
 	if err != nil {
+		return err
+	}
+	if err := applyModifiable(metrics, *modifiableArg); err != nil {
 		return err
 	}
 	tlsConfig, err := receive.LoadTLSConfig(*caFile, *serverName)
@@ -159,6 +163,30 @@ func parseMetrics(input string) (map[string]telemetry.MetricValue, error) {
 		return nil, fmt.Errorf("至少提供一个指标")
 	}
 	return metrics, nil
+}
+
+func applyModifiable(metrics map[string]telemetry.MetricValue, input string) error {
+	if strings.TrimSpace(input) == "" {
+		return nil
+	}
+	seen := make(map[string]bool)
+	for _, rawKey := range strings.Split(input, ",") {
+		key := strings.TrimSpace(rawKey)
+		if !validMetricKey(key) {
+			return fmt.Errorf("-modifiable 含无效指标 key %q", key)
+		}
+		if seen[key] {
+			return fmt.Errorf("-modifiable 中指标 %q 重复", key)
+		}
+		metric, exists := metrics[key]
+		if !exists {
+			return fmt.Errorf("-modifiable 指标 %q 必须同时出现在 -metrics 中", key)
+		}
+		metric.SetModifiable(true)
+		metrics[key] = metric
+		seen[key] = true
+	}
+	return nil
 }
 
 func validMetricKey(key string) bool {

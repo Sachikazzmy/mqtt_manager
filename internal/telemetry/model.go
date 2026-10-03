@@ -9,10 +9,19 @@ import (
 )
 
 type MetricValue struct {
-	Value        float64 `json:"value"`
-	Unit         string  `json:"unit"`
-	valuePresent bool
-	unitPresent  bool
+	Value             float64 `json:"value"`
+	Unit              string  `json:"unit"`
+	Modifiable        bool    `json:"modifiable,omitempty"`
+	valuePresent      bool
+	unitPresent       bool
+	modifiablePresent bool
+}
+
+// SetModifiable marks the protocol field as present when a producer builds a
+// message in memory. Parsed legacy messages keep the field absent on marshal.
+func (m *MetricValue) SetModifiable(value bool) {
+	m.Modifiable = value
+	m.modifiablePresent = true
 }
 
 func (m *MetricValue) UnmarshalJSON(data []byte) error {
@@ -25,7 +34,7 @@ func (m *MetricValue) UnmarshalJSON(data []byte) error {
 		return fmt.Errorf("解析指标失败：必须是 JSON 对象")
 	}
 	*m = MetricValue{}
-	seen := make(map[string]struct{}, 2)
+	seen := make(map[string]struct{}, 3)
 	for decoder.More() {
 		token, err = decoder.Token()
 		if err != nil {
@@ -52,6 +61,14 @@ func (m *MetricValue) UnmarshalJSON(data []byte) error {
 				m.Unit = *unit
 				m.unitPresent = true
 			}
+		case "modifiable":
+			var modifiable *bool
+			if err = decoder.Decode(&modifiable); err == nil && modifiable != nil {
+				m.Modifiable = *modifiable
+				m.modifiablePresent = true
+			} else if err == nil {
+				err = fmt.Errorf("必须是 JSON boolean，不能为 null")
+			}
 		default:
 			return fmt.Errorf("解析指标失败：不支持字段 %q", name)
 		}
@@ -66,6 +83,23 @@ func (m *MetricValue) UnmarshalJSON(data []byte) error {
 		return fmt.Errorf("解析指标失败：只能包含一个 JSON 对象")
 	}
 	return nil
+}
+
+// MarshalJSON preserves whether a legacy telemetry metric omitted modifiable.
+// That distinction is part of the raw historical message and must not be
+// filled in with a value invented by the server.
+func (m MetricValue) MarshalJSON() ([]byte, error) {
+	if m.modifiablePresent {
+		return json.Marshal(struct {
+			Value      float64 `json:"value"`
+			Unit       string  `json:"unit"`
+			Modifiable bool    `json:"modifiable"`
+		}{Value: m.Value, Unit: m.Unit, Modifiable: m.Modifiable})
+	}
+	return json.Marshal(struct {
+		Value float64 `json:"value"`
+		Unit  string  `json:"unit"`
+	}{Value: m.Value, Unit: m.Unit})
 }
 
 type Message struct {

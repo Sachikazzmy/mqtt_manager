@@ -12,21 +12,27 @@ import (
 	"sync/atomic"
 	"time"
 
+	"Project/internal/command"
 	"Project/internal/device"
 	"Project/internal/telemetry"
 	"github.com/eclipse/paho.golang/packets"
 	"github.com/eclipse/paho.golang/paho"
 )
 
-const telemetrySubscription = "factory/+/telemetry"
+const (
+	telemetrySubscription = "factory/+/telemetry"
+	resultSubscription    = "factory/+/command_result"
+)
 
 type Event struct {
-	Type      string
-	Status    string
-	DeviceID  string
-	MessageID string
-	Metrics   map[string]telemetry.MetricValue
-	Reason    string
+	Type          string
+	Status        string
+	DeviceID      string
+	MessageID     string
+	CommandID     string
+	CommandStatus string
+	Metrics       map[string]telemetry.MetricValue
+	Reason        string
 }
 
 type delivery struct {
@@ -38,26 +44,34 @@ type delivery struct {
 type Receiver struct {
 	config    Config
 	telemetry *telemetry.Service
+	commands  *command.Service
 	queue     chan delivery
 	events    chan Event
 	reconnect chan struct{}
 	closeOnce sync.Once
 	mu        sync.Mutex
+	clientMu  sync.RWMutex
+	client    *paho.Client
 	cancel    context.CancelFunc
 	done      chan struct{}
 	dropped   atomic.Uint64
 }
 
-func NewReceiver(config Config, telemetryService *telemetry.Service) (*Receiver, error) {
+func NewReceiver(config Config, telemetryService *telemetry.Service, commandServices ...*command.Service) (*Receiver, error) {
 	if config.QueueSize < 1 || config.QueueSize > 4096 {
 		return nil, fmt.Errorf("MQTT queue size 必须为 1 到 4096")
 	}
 	if telemetryService == nil {
 		return nil, fmt.Errorf("telemetry service 不能为空")
 	}
+	var commandService *command.Service
+	if len(commandServices) > 0 {
+		commandService = commandServices[0]
+	}
 	return &Receiver{
 		config:    config,
 		telemetry: telemetryService,
+		commands:  commandService,
 		queue:     make(chan delivery, config.QueueSize),
 		events:    make(chan Event, config.QueueSize),
 		reconnect: make(chan struct{}, 1),
@@ -144,10 +158,15 @@ func (r *Receiver) supervise(ctx context.Context) {
 			QoS:               1,
 			RetainAsPublished: true,
 			RetainHandling:    0,
+		}, {
+			Topic:             resultSubscription,
+			QoS:               1,
+			RetainAsPublished: true,
+			RetainHandling:    0,
 		}}})
 		cancel()
-		if err == nil && (suback == nil || len(suback.Reasons) != 1 || suback.Reasons[0] >= 0x80) {
-			err = fmt.Errorf("Broker 未接受遥测订阅")
+		if err == nil && (suback == nil || len(suback.Reasons) != 2 || suback.Reasons[0] >= 0x80 || suback.Reasons[1] >= 0x80) {
+			err = fmt.Errorf("Broker 未接受遥测和命令结果订阅")
 		}
 		if err != nil {
 			r.emit(Event{Type: "broker", Status: "offline", Reason: "订阅失败，稍后重试"})
@@ -158,15 +177,19 @@ func (r *Receiver) supervise(ctx context.Context) {
 			continue
 		}
 
-		r.emit(Event{Type: "broker", Status: "online", Reason: "已订阅 factory/+/telemetry"})
+		r.setClient(client)
+		r.emit(Event{Type: "broker", Status: "online", Reason: "遥测与命令结果订阅均已确认"})
 		select {
 		case <-ctx.Done():
+			r.clearClient(client)
 			_ = client.Disconnect(&paho.Disconnect{})
 			return
 		case <-client.Done():
 		case <-r.reconnect:
+			r.clearClient(client)
 			_ = client.Disconnect(&paho.Disconnect{})
 		}
+		r.clearClient(client)
 		r.emit(Event{Type: "broker", Status: "offline", Reason: "连接中断，稍后恢复订阅"})
 		if !waitContext(ctx, r.config.ReconnectDelay) {
 			return
@@ -264,6 +287,23 @@ func (r *Receiver) processDelivery(ctx context.Context, item delivery) {
 		return
 	}
 
+	if !strings.HasPrefix(packet.Topic, "factory/") {
+		r.rejectAndAck(item, deviceID, "Topic 不属于 factory/{device_id}/telemetry 或 command_result")
+		return
+	}
+	parts := strings.Split(packet.Topic, "/")
+	if len(parts) != 3 {
+		r.rejectAndAck(item, deviceID, "Topic 格式无效")
+		return
+	}
+	if parts[2] == command.ResultTopicSuffix {
+		r.processCommandResult(ctx, item, deviceID)
+		return
+	}
+	if parts[2] != "telemetry" {
+		r.rejectAndAck(item, deviceID, "Topic 不属于订阅的业务消息")
+		return
+	}
 	result, err := r.telemetry.ReceiveFromBroker(ctx, packet.Topic, packet.Payload)
 	switch {
 	case err == nil:
@@ -293,6 +333,96 @@ func (r *Receiver) processDelivery(ctx context.Context, item delivery) {
 	}
 }
 
+func (r *Receiver) processCommandResult(ctx context.Context, item delivery, topicDeviceID string) {
+	if r.commands == nil {
+		r.rejectAndAck(item, topicDeviceID, "命令服务未配置")
+		return
+	}
+	disposition, err := r.commands.ProcessResultFromBroker(ctx, item.packet.Topic, item.packet.Payload)
+	if err != nil {
+		if errors.Is(err, command.ErrInvalidResult) {
+			r.rejectAndAck(item, topicDeviceID, err.Error())
+			return
+		}
+		r.emit(Event{Type: "retry", DeviceID: topicDeviceID, Reason: "命令结果提交失败；消息未确认并将重投: " + err.Error()})
+		item.disconnect()
+		r.requestReconnect()
+		return
+	}
+	if disposition.Anomaly != "" {
+		r.emit(Event{Type: "reject", DeviceID: topicDeviceID, Reason: disposition.Anomaly})
+	} else if disposition.Command != nil {
+		r.emit(Event{Type: "command_result", DeviceID: topicDeviceID, CommandID: disposition.Command.CommandID, CommandStatus: disposition.Command.Status})
+	}
+	if ackErr := item.ack(); ackErr != nil {
+		r.requestReconnect()
+	}
+}
+
+func (r *Receiver) rejectAndAck(item delivery, deviceID, reason string) {
+	r.emit(Event{Type: "reject", DeviceID: deviceID, Reason: reason})
+	if err := item.ack(); err != nil {
+		r.requestReconnect()
+	}
+}
+
+// PublishCommand intentionally accepts a device identity, not an arbitrary
+// topic, so the outbox can only publish under that device's command namespace.
+func (r *Receiver) PublishCommand(ctx context.Context, deviceID string, payload []byte) error {
+	if !validDeviceTopicID(deviceID) {
+		return fmt.Errorf("命令设备编号无效")
+	}
+	r.clientMu.RLock()
+	client := r.client
+	r.clientMu.RUnlock()
+	if client == nil {
+		return fmt.Errorf("MQTT 命令发布连接尚未就绪")
+	}
+	select {
+	case <-client.Done():
+		return fmt.Errorf("MQTT 命令发布连接已断开")
+	default:
+	}
+	response, err := client.Publish(ctx, &paho.Publish{
+		Topic: "factory/" + deviceID + "/" + command.CommandTopicSuffix,
+		QoS:   1, Retain: false, Payload: payload,
+	})
+	if err != nil {
+		return err
+	}
+	if response == nil || response.ReasonCode >= 0x80 {
+		return fmt.Errorf("Broker 未确认命令发布")
+	}
+	return nil
+}
+
+func validDeviceTopicID(id string) bool {
+	if id == "" || len(id) > 64 || id == "admin" {
+		return false
+	}
+	for index, char := range id {
+		allowed := char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || char >= '0' && char <= '9' || char == '_' || char == '-'
+		if !allowed || index == 0 && !(char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || char >= '0' && char <= '9') {
+			return false
+		}
+	}
+	return true
+}
+
+func (r *Receiver) setClient(client *paho.Client) {
+	r.clientMu.Lock()
+	r.client = client
+	r.clientMu.Unlock()
+}
+
+func (r *Receiver) clearClient(client *paho.Client) {
+	r.clientMu.Lock()
+	if r.client == client {
+		r.client = nil
+	}
+	r.clientMu.Unlock()
+}
+
 func isPermanentRejection(err error) bool {
 	// ErrDeviceTransition is intentionally omitted: pending lifecycle operations
 	// must leave QoS 1 deliveries unacknowledged until the database state settles.
@@ -302,7 +432,8 @@ func isPermanentRejection(err error) bool {
 		errors.Is(err, telemetry.ErrDeviceMismatch) ||
 		errors.Is(err, telemetry.ErrDeviceDisabled) ||
 		errors.Is(err, telemetry.ErrInvalidSecret) ||
-		errors.Is(err, device.ErrNotFound)
+		errors.Is(err, device.ErrNotFound) ||
+		errors.Is(err, command.ErrInvalidResult)
 }
 
 func (r *Receiver) requestReconnect() {
@@ -359,7 +490,7 @@ func (r *Receiver) setReadiness(online bool) {
 
 func displayDeviceID(topic string) string {
 	parts := strings.Split(topic, "/")
-	if len(parts) == 3 && parts[0] == "factory" && parts[2] == "telemetry" {
+	if len(parts) == 3 && parts[0] == "factory" && (parts[2] == "telemetry" || parts[2] == command.ResultTopicSuffix) {
 		return parts[1]
 	}
 	return "-"

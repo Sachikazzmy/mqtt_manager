@@ -24,6 +24,6 @@ func run() error {
 	if err := manager.BootstrapReceiver(context.Background()); err != nil {
 		return err
 	}
-	fmt.Println("Broker 已就绪；后端订阅账户与管理账户分离，默认 ACL 为拒绝")
+	fmt.Println("Broker 已就绪；业务账户独立接收遥测/命令结果并发布设备命令，管理账户不发送业务命令，默认 ACL 为拒绝")
 	return nil
 }

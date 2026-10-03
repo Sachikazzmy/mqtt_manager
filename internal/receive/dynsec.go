@@ -43,6 +43,10 @@ type dynsecCommand struct {
 	RoleName string          `json:"rolename,omitempty"`
 	Roles    []dynsecRoleRef `json:"roles,omitempty"`
 	ACLs     []dynsecACL     `json:"acls,omitempty"`
+	ACLType  string          `json:"acltype,omitempty"`
+	Topic    string          `json:"topic,omitempty"`
+	Priority int             `json:"priority,omitempty"`
+	Allow    *bool           `json:"allow,omitempty"`
 }
 
 type dynsecResponse struct {
@@ -93,29 +97,8 @@ func (m *Manager) CreateDevice(ctx context.Context, id, secret string) error {
 	defer m.mu.Unlock()
 
 	roleName := deviceRoleName(id)
-	role, err := m.execute(ctx, dynsecCommand{Command: "getRole", RoleName: roleName})
-	if err != nil {
-		return err
-	}
-	if role.Error != "" {
-		if !isNotFound(role.Error) {
-			return commandFailure("读取设备发布角色", role)
-		}
-		role, err = m.execute(ctx, dynsecCommand{
-			Command:  "createRole",
-			RoleName: roleName,
-			ACLs: []dynsecACL{{
-				Type: "publishClientSend", Topic: telemetryTopic(id), Priority: 10, Allow: true,
-			}},
-		})
-		if err != nil {
-			return err
-		}
-		if role.Error != "" {
-			return commandFailure("创建设备发布角色", role)
-		}
-	} else if err := validateDeviceRole(role.Data, roleName, telemetryTopic(id)); err != nil {
-		return fmt.Errorf("Broker 中设备 %q 的账户角色冲突：%w", id, err)
+	if err := m.ensureDeviceRole(ctx, id); err != nil {
+		return fmt.Errorf("Broker 中设备 %q 的账户角色冲突或升级失败：%w", id, err)
 	}
 
 	client, err := m.execute(ctx, dynsecCommand{Command: "getClient", Username: id})
@@ -143,8 +126,9 @@ func (m *Manager) CreateDevice(ctx context.Context, id, secret string) error {
 	if err := validateDeviceClient(client.Data, id, roleName); err != nil {
 		return fmt.Errorf("Broker 中设备 %q 的账户冲突：%w", id, err)
 	}
-
-	// 进程重启后 Broker 可能还留有本应用创建的账户；角色校验通过后可安全轮换其密钥。
+	// This branch is only for an explicit new local registration that found an
+	// orphaned Broker account. ACL-only upgrades use UpgradeDeviceACL and never
+	// change credentials or enabled state.
 	return m.resetSecretLocked(ctx, id, secret, true)
 }
 
@@ -172,27 +156,8 @@ func (m *Manager) BootstrapReceiver(ctx context.Context) error {
 	}
 
 	roleName := receiverRoleName()
-	role, err := m.execute(ctx, dynsecCommand{Command: "getRole", RoleName: roleName})
-	if err != nil {
-		return err
-	}
-	if role.Error != "" {
-		if !isNotFound(role.Error) {
-			return commandFailure("读取订阅角色", role)
-		}
-		role, err = m.execute(ctx, dynsecCommand{
-			Command:  "createRole",
-			RoleName: roleName,
-			ACLs:     receiverACLs(),
-		})
-		if err != nil {
-			return err
-		}
-		if role.Error != "" {
-			return commandFailure("创建订阅角色", role)
-		}
-	} else if err := validateReceiverRole(role.Data, roleName); err != nil {
-		return fmt.Errorf("Broker 中订阅角色冲突：%w", err)
+	if err := m.ensureReceiverRole(ctx); err != nil {
+		return fmt.Errorf("Broker 中订阅角色冲突或升级失败：%w", err)
 	}
 
 	username := m.receiverUsername
@@ -221,7 +186,7 @@ func (m *Manager) BootstrapReceiver(ctx context.Context) error {
 	if err := validateDeviceClient(client.Data, username, roleName); err != nil {
 		return fmt.Errorf("Broker 中订阅账户冲突：%w", err)
 	}
-	return m.resetManagedSecretLocked(ctx, username, string(m.receiverPassword), true, roleName)
+	return nil
 }
 
 func (m *Manager) SetDeviceEnabled(ctx context.Context, id string, enabled bool) error {
@@ -402,7 +367,45 @@ func telemetryTopic(id string) string {
 	return "factory/" + id + "/telemetry"
 }
 
-func validateDeviceRole(data json.RawMessage, expectedRole, expectedTopic string) error {
+func commandTopic(id string) string { return "factory/" + id + "/command" }
+
+func commandResultTopic(id string) string { return "factory/" + id + "/command_result" }
+
+func legacyDeviceACLs(id string) []dynsecACL {
+	return []dynsecACL{{Type: "publishClientSend", Topic: telemetryTopic(id), Priority: 10, Allow: true}}
+}
+
+func deviceACLs(id string) []dynsecACL {
+	return []dynsecACL{
+		{Type: "publishClientSend", Topic: telemetryTopic(id), Priority: 10, Allow: true},
+		{Type: "publishClientSend", Topic: commandResultTopic(id), Priority: 10, Allow: true},
+		{Type: "subscribeLiteral", Topic: commandTopic(id), Priority: 10, Allow: true},
+		{Type: "publishClientReceive", Topic: commandTopic(id), Priority: 10, Allow: true},
+	}
+}
+
+func legacyReceiverACLs() []dynsecACL {
+	return []dynsecACL{
+		{Type: "subscribePattern", Topic: telemetrySubscription, Priority: 10, Allow: true},
+		{Type: "publishClientReceive", Topic: telemetrySubscription, Priority: 10, Allow: true},
+	}
+}
+
+func receiverACLs() []dynsecACL {
+	return []dynsecACL{
+		{Type: "subscribePattern", Topic: telemetrySubscription, Priority: 10, Allow: true},
+		{Type: "publishClientReceive", Topic: telemetrySubscription, Priority: 10, Allow: true},
+		{Type: "subscribePattern", Topic: resultSubscription, Priority: 10, Allow: true},
+		{Type: "publishClientReceive", Topic: resultSubscription, Priority: 10, Allow: true},
+		{Type: "publishClientSend", Topic: "factory/+/command", Priority: 10, Allow: true},
+	}
+}
+
+func aclKey(acl dynsecACL) string {
+	return fmt.Sprintf("%s\x00%s\x00%d\x00%t", acl.Type, acl.Topic, acl.Priority, acl.Allow)
+}
+
+func readRoleACLs(data json.RawMessage, expectedRole string) ([]dynsecACL, error) {
 	var envelope struct {
 		Role struct {
 			Name string      `json:"rolename"`
@@ -410,14 +413,148 @@ func validateDeviceRole(data json.RawMessage, expectedRole, expectedTopic string
 		} `json:"role"`
 	}
 	if err := json.Unmarshal(data, &envelope); err != nil {
-		return fmt.Errorf("解析角色失败")
+		return nil, errors.New("解析角色失败")
 	}
-	if envelope.Role.Name != expectedRole || len(envelope.Role.ACLs) != 1 {
-		return errors.New("角色权限与应用预期不一致")
+	if envelope.Role.Name != expectedRole {
+		return nil, errors.New("角色名称与应用预期不一致")
 	}
-	acl := envelope.Role.ACLs[0]
-	if acl.Type != "publishClientSend" || acl.Topic != expectedTopic || !acl.Allow {
-		return errors.New("角色没有严格限定为本设备遥测 Topic")
+	return envelope.Role.ACLs, nil
+}
+
+func validateACLSubset(actual, legacy, desired []dynsecACL) (map[string]bool, error) {
+	allowed := make(map[string]bool, len(desired))
+	for _, acl := range desired {
+		allowed[aclKey(acl)] = true
+	}
+	seen := make(map[string]bool, len(actual))
+	for _, acl := range actual {
+		key := aclKey(acl)
+		if !allowed[key] || seen[key] {
+			return nil, errors.New("角色含意外、重复或越权 ACL")
+		}
+		seen[key] = true
+	}
+	for _, acl := range legacy {
+		if !seen[aclKey(acl)] {
+			return nil, errors.New("角色缺少旧版必要 ACL")
+		}
+	}
+	return seen, nil
+}
+
+func (m *Manager) ensureDeviceRole(ctx context.Context, id string) error {
+	return m.ensureRole(ctx, deviceRoleName(id), legacyDeviceACLs(id), deviceACLs(id), "设备")
+}
+
+func (m *Manager) ensureReceiverRole(ctx context.Context) error {
+	return m.ensureRole(ctx, receiverRoleName(), legacyReceiverACLs(), receiverACLs(), "后端")
+}
+
+func (m *Manager) ensureRole(ctx context.Context, roleName string, legacy, desired []dynsecACL, label string) error {
+	role, err := m.execute(ctx, dynsecCommand{Command: "getRole", RoleName: roleName})
+	if err != nil {
+		return err
+	}
+	if role.Error != "" {
+		if !isNotFound(role.Error) {
+			return commandFailure("读取"+label+"角色", role)
+		}
+		created, createErr := m.execute(ctx, dynsecCommand{Command: "createRole", RoleName: roleName, ACLs: desired})
+		if createErr != nil {
+			return createErr
+		}
+		if created.Error != "" {
+			return commandFailure("创建"+label+"角色", created)
+		}
+		return nil
+	}
+	actual, err := readRoleACLs(role.Data, roleName)
+	if err != nil {
+		return err
+	}
+	seen, err := validateACLSubset(actual, legacy, desired)
+	if err != nil {
+		return err
+	}
+	for _, acl := range desired {
+		if seen[aclKey(acl)] {
+			continue
+		}
+		allow := acl.Allow
+		response, addErr := m.execute(ctx, dynsecCommand{
+			Command: "addRoleACL", RoleName: roleName, ACLType: acl.Type,
+			Topic: acl.Topic, Priority: acl.Priority, Allow: &allow,
+		})
+		if addErr != nil {
+			return addErr
+		}
+		if response.Error != "" {
+			return commandFailure("升级"+label+"角色 ACL", response)
+		}
+	}
+	verified, err := m.execute(ctx, dynsecCommand{Command: "getRole", RoleName: roleName})
+	if err != nil {
+		return err
+	}
+	if verified.Error != "" {
+		return commandFailure("复核"+label+"角色", verified)
+	}
+	actual, err = readRoleACLs(verified.Data, roleName)
+	if err != nil {
+		return err
+	}
+	seen, err = validateACLSubset(actual, legacy, desired)
+	if err != nil || len(seen) != len(desired) {
+		return errors.New("角色 ACL 升级未达到完整预期")
+	}
+	return nil
+}
+
+func (m *Manager) UpgradeDeviceACL(ctx context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	client, err := m.execute(ctx, dynsecCommand{Command: "getClient", Username: id})
+	if err != nil {
+		return err
+	}
+	if client.Error != "" {
+		if isNotFound(client.Error) {
+			return device.ErrNotFound
+		}
+		return commandFailure("读取设备账户", client)
+	}
+	if err := validateDeviceClient(client.Data, id, deviceRoleName(id)); err != nil {
+		return fmt.Errorf("拒绝升级意外设备账户：%w", err)
+	}
+	return m.ensureDeviceRole(ctx, id)
+}
+
+// UpgradeReceiverACL upgrades only the business account's role permissions.
+// It deliberately does not create the account or change its password/state.
+func (m *Manager) UpgradeReceiverACL(ctx context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.ensureReceiverRole(ctx)
+}
+
+func validateDeviceRole(data json.RawMessage, expectedRole, expectedTopic string) error {
+	actual, err := readRoleACLs(data, expectedRole)
+	if err != nil {
+		return err
+	}
+	legacy := []dynsecACL{{Type: "publishClientSend", Topic: expectedTopic, Priority: 10, Allow: true}}
+	desired := []dynsecACL{
+		legacy[0],
+		{Type: "publishClientSend", Topic: strings.TrimSuffix(expectedTopic, "/telemetry") + "/command_result", Priority: 10, Allow: true},
+		{Type: "subscribeLiteral", Topic: strings.TrimSuffix(expectedTopic, "/telemetry") + "/command", Priority: 10, Allow: true},
+		{Type: "publishClientReceive", Topic: strings.TrimSuffix(expectedTopic, "/telemetry") + "/command", Priority: 10, Allow: true},
+	}
+	_, err = validateACLSubset(actual, legacy, desired)
+	if err != nil {
+		return err
+	}
+	if len(actual) != len(legacy) && len(actual) != len(desired) {
+		return errors.New("角色 ACL 正处于部分升级状态")
 	}
 	return nil
 }
@@ -440,7 +577,7 @@ func validateDeviceClient(data json.RawMessage, expectedID, expectedRole string)
 	if len(envelope.Client.Groups) != 0 {
 		return errors.New("账户绑定了非预期组权限")
 	}
-	if len(envelope.Client.Roles) != 1 || envelope.Client.Roles[0].Name != expectedRole {
+	if len(envelope.Client.Roles) != 1 || envelope.Client.Roles[0].Name != expectedRole || envelope.Client.Roles[0].Priority != 10 {
 		return errors.New("账户不是仅绑定本设备专属角色")
 	}
 	return nil
@@ -463,35 +600,19 @@ func receiverRoleName() string {
 	return "__project01_receiver_role__"
 }
 
-func receiverACLs() []dynsecACL {
-	return []dynsecACL{
-		{Type: "subscribePattern", Topic: telemetrySubscription, Priority: 10, Allow: true},
-		{Type: "publishClientReceive", Topic: telemetrySubscription, Priority: 10, Allow: true},
-	}
-}
-
 func validateReceiverRole(data json.RawMessage, expectedRole string) error {
-	var envelope struct {
-		Role struct {
-			Name string      `json:"rolename"`
-			ACLs []dynsecACL `json:"acls"`
-		} `json:"role"`
+	actual, err := readRoleACLs(data, expectedRole)
+	if err != nil {
+		return err
 	}
-	if err := json.Unmarshal(data, &envelope); err != nil {
-		return errors.New("解析订阅角色失败")
+	legacy := legacyReceiverACLs()
+	desired := receiverACLs()
+	_, err = validateACLSubset(actual, legacy, desired)
+	if err != nil {
+		return err
 	}
-	if envelope.Role.Name != expectedRole || len(envelope.Role.ACLs) != 2 {
-		return errors.New("订阅角色权限与应用预期不一致")
-	}
-	seen := make(map[string]bool, len(envelope.Role.ACLs))
-	for _, acl := range envelope.Role.ACLs {
-		if acl.Topic != telemetrySubscription || acl.Priority != 10 || !acl.Allow {
-			return errors.New("订阅角色权限范围不符合预期")
-		}
-		seen[acl.Type] = true
-	}
-	if !seen["subscribePattern"] || !seen["publishClientReceive"] {
-		return errors.New("订阅角色缺少必要 ACL")
+	if len(actual) != len(legacy) && len(actual) != len(desired) {
+		return errors.New("后端角色 ACL 正处于部分升级状态")
 	}
 	return nil
 }

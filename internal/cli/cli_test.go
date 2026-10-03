@@ -3,6 +3,7 @@ package cli_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"Project/internal/cli"
+	"Project/internal/command"
 	"Project/internal/device"
 	"Project/internal/receive"
 	"Project/internal/storage"
@@ -25,7 +27,7 @@ func newCommands(out *bytes.Buffer, secretReader cli.SecretReader) (*cli.CLI, *d
 	}, telemetry.Config{
 		MaxFutureSkew: 5 * time.Minute,
 	})
-	return cli.New(devices, telemetryService, out, secretReader), devices, telemetryService
+	return cli.New(devices, telemetryService, out, secretReader, command.NewService(devices, store)), devices, telemetryService
 }
 
 func TestCommandLifecycle(t *testing.T) {
@@ -118,6 +120,57 @@ func TestMetricManagementCommandIsRemovedAndDeviceOutputHidesDefinitions(t *test
 	output := out.String()
 	if strings.Contains(output, "metric_definitions") || strings.Contains(output, "temperature") || strings.Contains(output, "pressure") || strings.Contains(output, "current") {
 		t.Fatalf("新设备 list 输出不应包含定义管理字段或旧默认项: %s", output)
+	}
+}
+
+func TestCommandCLISetClearGetAndBoundedHistory(t *testing.T) {
+	ctx := context.Background()
+	var out bytes.Buffer
+	commands, devices, telemetryService := newCommands(&out, nil)
+	secret, err := devices.Create(ctx, "linux-01", "测试设备")
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte(`{"version":"1","device_id":"linux-01","message_id":"first","sampled_at":"2026-09-27T11:59:00Z","metrics":{"segment-1":{"value":23.6,"unit":"V","modifiable":true},"segment-2":{"value":0,"unit":"V","modifiable":true},"segment-3":{"value":1,"unit":"V"}}}`)
+	if err := telemetryService.Receive(ctx, "linux-01", secret, payload); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := commands.Execute(ctx, "set linux-01 segment-1 120"); err != nil {
+		t.Fatal(err)
+	}
+	var setEntry command.Command
+	if err := json.Unmarshal(out.Bytes(), &setEntry); err != nil {
+		t.Fatalf("set 应返回 command_id 和状态 JSON: %v / %s", err, out.String())
+	}
+	if setEntry.CommandID == "" || setEntry.Status != command.StatusWaitingToSend || setEntry.Value == nil || *setEntry.Value != 120 {
+		t.Fatalf("set CLI 返回值 = %#v", setEntry)
+	}
+	out.Reset()
+	if _, err := commands.Execute(ctx, "command linux-01 "+setEntry.CommandID); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), setEntry.CommandID) || !strings.Contains(out.String(), command.StatusWaitingToSend) {
+		t.Fatalf("command 应查询单条状态: %s", out.String())
+	}
+	out.Reset()
+	if _, err := commands.Execute(ctx, "clear linux-01 segment-2"); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out.String(), `"value"`) {
+		t.Fatalf("clear 命令不应包含 value: %s", out.String())
+	}
+	out.Reset()
+	if _, err := commands.Execute(ctx, "commands linux-01 10"); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), setEntry.CommandID) || !strings.Contains(out.String(), command.StatusWaitingToSend) {
+		t.Fatalf("commands 应返回有限历史: %s", out.String())
+	}
+	if _, err := commands.Execute(ctx, "commands linux-01 101"); !errors.Is(err, command.ErrCommandLimit) {
+		t.Fatalf("CLI 必须限制命令历史数量: %v", err)
+	}
+	if _, err := commands.Execute(ctx, "set linux-01 segment-3 10"); !errors.Is(err, command.ErrMetricNotMutable) {
+		t.Fatalf("不可修改指标应拒绝: %v", err)
 	}
 }
 

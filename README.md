@@ -1,6 +1,6 @@
-# Project01 阶段 A：部分遥测指标与逐指标 Latest
+# Project01：部分遥测指标与模拟指标命令
 
-本阶段基于阶段 4 的 Mosquitto Dynamic Security、容器内 Go CLI、MQTT 设备认证、持续遥测接收和 PostgreSQL 持久化，支持每设备按变化只上报部分 `segment-N` 指标，并独立维护每项 Latest。新设备无需在 CLI 预登记指标；首次合法上报会将该 key 和单位绑定到该设备，默认最多绑定 10 个，硬上限为 100。当前不包含指标定义管理命令、设备下发命令、HTTP API 或 Web UI。设备配置、密钥验证摘要、指标内部身份、Latest、历史与去重键保存在数据库。
+系统支持每设备按变化只上报部分 `segment-N` 指标，并独立维护每项 Latest。首次合法上报会将 key 和单位绑定到该设备，默认最多绑定 10 个，硬上限为 100。当前 CLI 仅支持向设备下发模拟指标 `set_metric` / `clear_override` 命令，不支持真实执行器控制；没有指标定义管理命令、HTTP API 或 Web UI。设备配置、密钥验证摘要、指标身份、Latest、原始历史及命令 outbox 保存在 PostgreSQL。
 
 部署步骤见 [部署说明](docs/deployment.md)，交给下位机开发者的连接参数见 [设备接入交接](docs/device-handoff.md)。
 
@@ -13,7 +13,7 @@ MQTT_CERT_DNS_NAME=mqtt.web4sachika.asia MQTT_CERT_IP=10.0.0.113 ./scripts/renew
 docker compose attach backend
 ```
 
-Compose 管理 `broker`、`db`、一次性 `broker-init` 和 `backend`。已有证书续签保留原 CA，备份旧服务器证书；日常启动只需运行初始化脚本，不必重复续签。Go 在容器内运行，CLI 与 MQTT 接收共用 PostgreSQL 仓储。用 Ctrl-P、Ctrl-Q 依次按下离开附着终端，保持接收运行；`quit`/Ctrl-C 会结束进程。不要再启动第二个 server。Broker 断线时本地查询仍可用，依赖 Broker 的设备操作会返回错误。
+Compose 管理 `broker`、`db`、一次性 `broker-init` 和 `backend`。已有证书续签保留原 CA，备份旧服务器证书；日常启动只需运行初始化脚本，不必重复续签。Go 在容器内运行，CLI 与 MQTT 接收共用 PostgreSQL 仓储。用 Ctrl-P、Ctrl-Q 依次按下离开附着终端，保持接收运行；`quit`/Ctrl-C 会结束进程。不要再启动第二个 server。Broker 断线时本地查询仍可用；命令仍会先进入 outbox，再按有限次数重试。
 
 后端关闭 Docker 日志持久化，避免 CLI 展示的一次性密钥落盘；实时消息通过附着终端查看，历史通过 CLI 查询。不要对该终端启用录屏或输出重定向。
 
@@ -32,6 +32,10 @@ reset-secret device-001
 receive device-001 ./sample.json
 history device-001 20
 history device-001 20 2026-09-27T00:00:00Z 2026-09-28T00:00:00Z
+set device-001 segment-1 120
+command device-001 <command_id>
+commands device-001 20
+clear device-001 segment-1
 delete device-001
 quit
 ```
@@ -45,9 +49,12 @@ quit
 ```sh
 docker compose exec backend publish -address broker:8883 -server-name broker -ca /run/secrets/mqtt_ca_cert -device device-001
 docker compose exec backend publish -address broker:8883 -server-name broker -ca /run/secrets/mqtt_ca_cert -device device-001 -metrics segment-1=23.6:V,segment-3=0:A
+docker compose exec backend publish -address broker:8883 -server-name broker -ca /run/secrets/mqtt_ca_cert -device device-001 -metrics segment-1=23.6:V,segment-3=0:A -modifiable segment-1
 ```
 
 模拟器可以只选一个或多个指标；不同次运行可用不同的 `-metrics` 子集。`segment-1` 至 `segment-100` 无需先登记，首次合法上报会在每设备身份数量未达配置上限时自动绑定该项单位。新设备只使用 segment 指标；已有数据库中被历史采样引用的旧指标身份为兼容历史而保留，未被历史使用的旧默认项由迁移移除。模拟器会在控制终端无回显地读取设备密钥。输出的 `PUBACK` 只表示 Broker 确认了 MQTT 发布，不代表 Go 已验证或保存业务数据；业务接收结果由运行 `cmd/server` 的终端显示。
+
+`-modifiable` 只接受 `-metrics` 本次上报中存在的 key，并将它们的能力设为 true；没列出的项仍省略字段并按 false 处理。模拟器每次运行使用新 UUID，不重发已缓存的同一采样。
 
 ## 遥测消息
 
@@ -60,14 +67,14 @@ docker compose exec backend publish -address broker:8883 -server-name broker -ca
   "message_id": "boot-20260927-0001",
   "sampled_at": "2026-09-27T12:00:00Z",
   "metrics": {
-    "segment-1": {"value": 0, "unit": "V"}
+    "segment-1": {"value": 0, "unit": "V", "modifiable": true}
   }
 }
 ```
 
 新设备首次合法上报某个规范 `segment-N` 后，服务自动记住该 key 和首次上报的单位。`MAX_METRICS_PER_DEVICE` 默认 10，范围为 1 到 100，限制每台设备已绑定的指标身份总数；旧库中仍被历史引用的兼容指标也占用容量。没有上报过的 segment 不会出现在 Latest。任何值都必须是有限 JSON 数字，`0` 合法。默认未来采样时间容差为 5 分钟，超出会拒收。采样时间和服务端接收时间均按 UTC 保存。
 
-必填字段、消息大小和长度都会校验。`value: 0` 是合法值，缺少 `value` 会拒收。`message_id` 必须在同一设备重启后仍保持唯一，去重键为 `(device_id, message_id)`。
+旧设备可省略每个指标的 `modifiable` 字段，缺省按 false 处理；新设备必须只传 JSON boolean。历史保留原始指标子集和字段是否出现，不回填旧记录。`value: 0` 合法；消息中的 `message_id` 必须跨设备重启唯一，去重键为 `(device_id, message_id)`。
 
 ## MQTT 上报标准（v1）
 
@@ -92,7 +99,8 @@ factory/{device_id}/telemetry
   "message_id": "01J8V3Y7Q5M4K2N6P8R0S1T2U3",
   "sampled_at": "2026-09-29T04:15:30.123Z",
   "metrics": {
-    "segment-1": {"value": 23.6, "unit": "V"}
+    "segment-1": {"value": 23.6, "unit": "V", "modifiable": true},
+    "segment-3": {"value": 55.0, "unit": "C", "modifiable": false}
   }
 }
 ```
@@ -107,7 +115,7 @@ factory/{device_id}/telemetry
 | `sampled_at` | 必填 RFC3339 时间，必须带时区；设备端推荐统一发送 UTC 的 `Z`，后端按 UTC 保存。明显晚于服务端时间的消息拒绝，默认容差为 5 分钟。 |
 | `metrics` | 必填非空对象；可以只包含本次有新样本的一个或多个指标。规范的 `segment-1` 至 `segment-100` 可在首次合法上报时自动绑定单位，但不得超过每设备身份总数上限（默认 10；旧历史定义也计数）；payload 最大 64 KiB。 |
 
-指标 key 只能由 ASCII 字母、数字、下划线和连字符组成，且以字母或数字开头，最多 64 字节。新设备仅接受规范 `segment-1` 至 `segment-100`；首次合法上报会自动绑定本次 `unit`，后续消息必须完全一致。此版本没有定义管理命令；没有上报过的指标不会显示在设备 Latest 中。`MAX_METRICS_PER_DEVICE` 限制每台设备已绑定身份总数，范围为 1 到 100。不能把已用编号改作其他物理含义或单位；需要变化时，应在设备集成记录中选择新编号。已有历史引用的 legacy key 及其单位不会被升级迁移删除，只有未被历史使用的旧默认定义会清理。
+每个指标对象只接受 `value`、`unit` 和可选 `modifiable`。`modifiable` 必须是 JSON boolean，不能为 null、字符串或数字；重复字段和其他未知字段拒收。Latest 的 value、unit、modifiable 和时间按相同 `(sampled_at, received_at, message_id)` 决胜顺序更新。旧格式缺省时 Latest 使用 false；乱序消息不会覆盖较新的修改能力。它是设备声明，不替代操作权限或下位机执行时校验。指标 key 只能由 ASCII 字母、数字、下划线和连字符组成，且以字母或数字开头，最多 64 字节。新设备仅接受规范 `segment-1` 至 `segment-100`；首次合法上报会自动绑定本次 `unit`，后续消息必须完全一致。没有上报过的指标不会显示在设备 Latest 中。`MAX_METRICS_PER_DEVICE` 限制每台设备已绑定身份总数，范围为 1 到 100。不能把已用编号改作其他物理含义或单位；需要变化时，应在设备集成记录中选择新编号。已有历史引用的 legacy key 及其单位不会被升级迁移删除，只有未被历史使用的旧定义会清理。
 
 一次消息中重复出现同一个顶层字段、metric key、指标对象内的 `value` 或 `unit`，上报非规范或未登记 key、超过身份容量、已停用指标、单位不一致、非法 UTF-8 或 payload 超限都会被拒绝。v1 顶层结构及每项 `{"value": ..., "unit": ...}` 格式保持不变。
 
@@ -115,9 +123,9 @@ factory/{device_id}/telemetry
 
 ### Broker 接收入口
 
-普通 MQTT 订阅消息不含发布者的连接密码。Mosquitto 先验证发布者用户名和密钥，再用 Dynamic Security ACL 将每个设备限制为仅可发布其自身的 `factory/{device_id}/telemetry`。Go 使用独立的订阅账户，仅允许订阅和接收 `factory/+/telemetry`。接收适配调用 `telemetry.Service.ReceiveFromBroker`；该入口校验 Topic、载荷身份和完整协议，再由 `CommitFromBroker` 在数据库事务内完成设备存在/启用检查、去重、历史追加和 Latest 更新。此入口只供已受 TLS、Broker 认证及 ACL 保护的接收适配使用，不会关闭本机 `receive` 的密钥验证。
+普通 MQTT 订阅消息不含发布者的连接密码。设备 ACL 只允许发布自己的 telemetry 和 command_result，并订阅/接收自己的 command。Go 使用独立业务账户，订阅接收 telemetry/result 并发布 `factory/+/command`；Dynamic Security 管理账户不发送业务命令。接收适配按 Topic 分流，遥测调用 `telemetry.Service.ReceiveFromBroker`，命令结果调用命令服务；两类订阅都成功才报告就绪。启动时按需幂等补齐旧角色的 ACL，保留账户、密钥和启用状态，部分升级会重试。遥测在事务内去重、写原始历史并合并 Latest。
 
-消息通过 `ReceiveFromBroker` 校验及存储提交后，Go 才将 QoS 1 ACK 加入 Paho 的确认队列。Paho 按顺序发送 ACK；进程若在存储后、Broker 收到 ACK 前退出，重复投递会由 `(device_id, message_id)` 去重。设备收到的 PUBACK 仅表示 Broker 收到发布，并不等于 Go 已提交；Go 的订阅 ACK 仅在数据库事务成功提交后排队。永久拒收和重复消息会确认并丢弃；暂时存储错误保持未确认并触发重连。
+Telemetry 和 command_result 分流处理，分别在对应数据库事务提交后，Go 才将 QoS 1 ACK 加入 Paho 的确认队列。Paho 按顺序发送 ACK；进程若在存储后、Broker 收到 ACK 前退出，telemetry 重投由 `(device_id, message_id)` 去重，重复结果也幂等。设备收到的 PUBACK 仅表示 Broker 收到发布，并不等于 Go 已提交；Go 的订阅 ACK 仅在数据库事务成功提交后排队。永久拒收和重复消息会确认并丢弃；暂时存储错误保持未确认并触发重连。
 
 回调只将消息放进有界队列，默认 128 条、上限 4096；队列满时消息不确认并触发断开/重连。一个有界 worker 负责校验和数据库提交。退出时未处理的队列消息不确认；Broker 持久会话最多保留 24 小时，超出后可能过期。终端事件缓冲也有上限，溢出的显示事件会汇总提示，可用 `get`、`list`、`history` 查询当前状态。
 
@@ -125,7 +133,7 @@ Broker 禁止新 retained 发布。订阅使用 MQTT 5 的 retain-as-published �
 
 ## 状态语义
 
-设备创建后 `latest` 为 `null`。收到合法且非重复消息后，`latest.metrics` 按 `metric_key` 合并各指标独立的最新状态。每项分别包含 `value`、`unit`、`sampled_at`、`received_at` 和 `message_id`。本次未上报的指标保留旧值和旧时间，不会被清空或写成零。设备对象顶层的 `last_valid_received_at` 只表示最后一条有效非重复消息的服务端接收时间。
+设备创建后 `latest` 为 `null`。收到合法且非重复消息后，`latest.metrics` 按 `metric_key` 合并各指标独立的最新状态。每项分别包含 `value`、`unit`、`modifiable`、`sampled_at`、`received_at` 和 `message_id`。本次未上报的指标保留全部旧状态，不会被清空或写成零。设备对象顶层的 `last_valid_received_at` 只表示最后一条有效非重复消息的服务端接收时间。
 
 例如 10:00 上报 `segment-1`，11:00 上报 `segment-2` 和 `segment-3`：Latest 同时包含三项，其中 `segment-1.sampled_at` 仍为 10:00；历史有两条原始消息，第二条只含两项。乱序旧样本也作为原样消息进入历史，但只会在对应指标的 `(sampled_at, received_at, message_id)` 决胜顺序更新时覆盖该项 Latest。重复或拒收消息不写历史，也不推进 `last_valid_received_at`。
 
@@ -136,9 +144,9 @@ Broker 禁止新 retained 发布。订阅使用 MQTT 5 的 retain-as-published �
   "last_valid_received_at": "2026-09-27T11:00:05Z",
   "latest": {
     "metrics": {
-      "segment-1": {"value": 1, "unit": "V", "sampled_at": "2026-09-27T10:00:00Z", "received_at": "2026-09-27T10:00:05Z", "message_id": "m-10"},
-      "segment-2": {"value": 2, "unit": "kPa", "sampled_at": "2026-09-27T11:00:00Z", "received_at": "2026-09-27T11:00:05Z", "message_id": "m-11"},
-      "segment-3": {"value": 3, "unit": "A", "sampled_at": "2026-09-27T11:00:00Z", "received_at": "2026-09-27T11:00:05Z", "message_id": "m-11"}
+      "segment-1": {"value": 1, "unit": "V", "modifiable": false, "sampled_at": "2026-09-27T10:00:00Z", "received_at": "2026-09-27T10:00:05Z", "message_id": "m-10"},
+      "segment-2": {"value": 2, "unit": "kPa", "modifiable": false, "sampled_at": "2026-09-27T11:00:00Z", "received_at": "2026-09-27T11:00:05Z", "message_id": "m-11"},
+      "segment-3": {"value": 3, "unit": "A", "modifiable": true, "sampled_at": "2026-09-27T11:00:00Z", "received_at": "2026-09-27T11:00:05Z", "message_id": "m-11"}
     }
   }
 }
@@ -154,6 +162,56 @@ Broker 禁止新 retained 发布。订阅使用 MQTT 5 的 retain-as-published �
 
 历史查询必须指定正数数量限制，最多返回 1000 条；未指定时间时默认查询最近 24 小时，单次时间范围最多 7 天。可选设备 ID、起始时间和结束时间。返回超过限制时只保留符合条件的最新记录，再按采样时间升序返回；查询期间会响应 context 取消。
 
+## 模拟指标命令
+
+CLI 只接受 `set` 和 `clear` 两类命令。提交前检查设备存在、已启用且没有生命周期操作、指标有有效 Latest 且最新 `modifiable=true`；`set` 还使用已有实际范围约束，不添加温度/压力/电流默认定义或固定范围。新 segment 当前没有管理 CLI 范围配置，因此只校验有限数值。下位机仍须在执行时检查指标是否存在、是否可修改和值是否合法。
+
+```text
+set linux-01 segment-1 120
+command linux-01 <command_id>
+commands linux-01 20
+clear linux-01 segment-1
+command linux-01 <clear-command-id>
+get linux-01
+history linux-01 20
+```
+
+`set` 发布到 `factory/{device_id}/command`：
+
+```json
+{"version":"1","command_id":"c7c8923d-0674-4b7e-9966-aa4b80c37a2d","action":"set_metric","metric_key":"segment-1","value":120.0}
+```
+
+`clear` 同样发往该 Topic，但不带 value：
+
+```json
+{"version":"1","command_id":"fd5a0ce0-3021-4db5-91de-80bc1004a9c9","action":"clear_override","metric_key":"segment-1"}
+```
+
+设备在 `factory/{device_id}/command_result` 发布结果，QoS 1、`retain=false`。设置成功需要回显目标 value：
+
+```json
+{"version":"1","command_id":"c7c8923d-0674-4b7e-9966-aa4b80c37a2d","status":"applied","metric_key":"segment-1","value":120.0}
+```
+
+设备拒绝时必须回显请求中的原 value；这个值不是实际采样：
+
+```json
+{"version":"1","command_id":"c7c8923d-0674-4b7e-9966-aa4b80c37a2d","status":"rejected","metric_key":"segment-1","value":120.0}
+```
+
+清除覆盖成功建议不带 value：
+
+```json
+{"version":"1","command_id":"fd5a0ce0-3021-4db5-91de-80bc1004a9c9","status":"applied","metric_key":"segment-1"}
+```
+
+结果设备身份来自 Topic；结果无需新增 `device_id`、`action` 或时间字段。上位机先持久化命令再异步发送。`waiting_to_send` 表示排队/受限重试，`broker_acked` 只表示 Broker PUBACK，`applied`/`rejected` 才是设备报告结果；`result_unknown` 表示期限后执行情况仍未知，允许有效迟到结果更新终态。默认最多 5 次发送、间隔 5 秒起指数退避且上限 60 秒，期限 10 分钟。同设备同指标最多一条未解决命令；能力在首次发送前变化会取消命令，后续重试发现能力撤回则执行状态为未知。
+
+命令结果只提交命令状态并在数据库提交后 ACK，不写 Latest 或历史。`applied` 不等于遥测已观察到目标值；需随后用 `get`/`history` 检查设备实际 telemetry。数值相等也无法建立严格因果关系。设备禁用或进入生命周期过渡时停止发送/重试；期限仍按创建时间运行。期限结束时，至少尝试过一次发布的命令转为 `result_unknown`；从未发送的命令标为 `cancelled`。删除会取消未解决命令。
+
+服务端重用原 command_id 重试并拒绝相同 ID 的不同内容，但无法阻止 Broker 向下位机重复投递。设备应跨重启持久保存 command_id、原命令和处理结果；同 ID 同内容返回原结果不再执行，同 ID 不同内容拒绝。执行日志与模拟 override 必须原子持久化，使“执行后、回复前崩溃”在重启后不会二次执行，并恢复有效覆盖状态。当前仓库下位机参考程序只有单次旧格式 telemetry 发布，没有命令订阅、结果发布或去重/覆盖持久化实现；真实下位机尚需完成此部分。命令协议未包含执行序号或绝对过期时间，离线期间 Broker 可能延迟投递已经过服务端期限的消息，设备必须自行验证当前状态。
+
 ## 依赖与数据流
 
 ```text
@@ -161,9 +219,9 @@ cmd/server
   -> cli
      ├-> device.Service -> Broker Dynamic Security
      ├-> receive.Receiver <- Mosquitto (TLS, QoS 1)
-     │  -> 有界队列 -> telemetry.ReceiveFromBroker
-     └-> telemetry.Service
-        -> storage.PostgresStore（事务去重 + history + Latest）
+     │  -> 有界队列 -> telemetry.Service / command.Service
+     ├-> command.Service -> 持久 outbox -> 业务 MQTT 发布账户
+     └-> storage.PostgresStore（事务去重 + history + Latest + 命令结果）
 
 本地 JSON 文件 + 控制终端密钥
   -> telemetry.Receive（保留密钥验证）

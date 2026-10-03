@@ -49,13 +49,86 @@ func clientData(id, role string, disabled bool) json.RawMessage {
 }
 
 func deviceRoleData(id string) json.RawMessage {
+	return roleData(deviceRoleName(id), legacyDeviceACLs(id))
+}
+
+func roleData(name string, acls []dynsecACL) json.RawMessage {
 	value, _ := json.Marshal(map[string]any{
 		"role": map[string]any{
-			"rolename": deviceRoleName(id),
-			"acls":     []map[string]any{{"acltype": "publishClientSend", "topic": telemetryTopic(id), "priority": 10, "allow": true}},
+			"rolename": name,
+			"acls":     acls,
 		},
 	})
 	return value
+}
+
+func TestUpgradeExistingDeviceACLPreservesClientAndCompletesPartialUpgrade(t *testing.T) {
+	id := "linux-01"
+	oldClient := clientData(id, deviceRoleName(id), false)
+	fullRole := roleData(deviceRoleName(id), deviceACLs(id))
+	first := &scriptedTransport{answers: [][]dynsecResponse{
+		{{Command: "getClient", Data: oldClient}},
+		{{Command: "getRole", Data: deviceRoleData(id)}},
+		{success("addRoleACL")},
+		{{Command: "addRoleACL", Error: "temporary failure"}},
+	}}
+	manager := &Manager{transport: first}
+	if err := manager.UpgradeDeviceACL(context.Background(), id); err == nil {
+		t.Fatal("故意中断的部分 ACL 升级应报告失败")
+	}
+	if len(first.calls) != 4 || first.calls[2][0].Command != "addRoleACL" || first.calls[3][0].ACLType != "subscribeLiteral" {
+		t.Fatalf("部分升级调用序列 = %#v", first.calls)
+	}
+	for _, calls := range first.calls {
+		for _, call := range calls {
+			if call.Command == "setClientPassword" || call.Command == "disableClient" || call.Command == "createClient" {
+				t.Fatalf("ACL 升级不应重建或轮换设备账户: %#v", call)
+			}
+		}
+	}
+
+	partial := append(append([]dynsecACL(nil), legacyDeviceACLs(id)...), deviceACLs(id)[1])
+	second := &scriptedTransport{answers: [][]dynsecResponse{
+		{{Command: "getClient", Data: oldClient}},
+		{{Command: "getRole", Data: roleData(deviceRoleName(id), partial)}},
+		{success("addRoleACL")},
+		{success("addRoleACL")},
+		{{Command: "getRole", Data: fullRole}},
+	}}
+	manager.transport = second
+	if err := manager.UpgradeDeviceACL(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+	if len(second.calls) != 5 || second.calls[0][0].Username != id || second.calls[2][0].ACLType != "subscribeLiteral" || second.calls[3][0].ACLType != "publishClientReceive" {
+		t.Fatalf("恢复后的 ACL 升级调用 = %#v", second.calls)
+	}
+}
+
+func TestBootstrapUpgradesBackendRoleWithoutResettingExistingAccount(t *testing.T) {
+	config := Config{ReceiverUsername: "__project01_receiver__", ReceiverPassword: []byte("configured-secret")}
+	oldRole := roleData(receiverRoleName(), legacyReceiverACLs())
+	fullRole := roleData(receiverRoleName(), receiverACLs())
+	transport := &scriptedTransport{answers: [][]dynsecResponse{
+		{success("setDefaultACLAccess")},
+		{{Command: "getRole", Data: oldRole}},
+		{success("addRoleACL")},
+		{success("addRoleACL")},
+		{success("addRoleACL")},
+		{{Command: "getRole", Data: fullRole}},
+		{{Command: "getClient", Data: clientData(config.ReceiverUsername, receiverRoleName(), false)}},
+	}}
+	manager := NewManager(config)
+	manager.transport = transport
+	if err := manager.BootstrapReceiver(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for _, calls := range transport.calls {
+		for _, call := range calls {
+			if call.Command == "setClientPassword" || call.Command == "disableClient" || call.Command == "enableClient" || call.Command == "createClient" {
+				t.Fatalf("升级已有后端角色不应改动账户或密钥: %#v", call)
+			}
+		}
+	}
 }
 
 func TestCreateDeviceCreatesNarrowRoleAndAccount(t *testing.T) {
@@ -73,12 +146,14 @@ func TestCreateDeviceCreatesNarrowRoleAndAccount(t *testing.T) {
 		t.Fatalf("管理调用次数=%d", len(transport.calls))
 	}
 	roleCommand := transport.calls[1][0]
-	if roleCommand.Command != "createRole" || roleCommand.RoleName != deviceRoleName("device-001") || len(roleCommand.ACLs) != 1 {
+	if roleCommand.Command != "createRole" || roleCommand.RoleName != deviceRoleName("device-001") || len(roleCommand.ACLs) != 4 {
 		t.Fatalf("设备角色命令 = %#v", roleCommand)
 	}
-	acl := roleCommand.ACLs[0]
-	if acl.Type != "publishClientSend" || acl.Topic != "factory/device-001/telemetry" || !acl.Allow {
-		t.Fatalf("设备 ACL 过宽或方向错误: %#v", acl)
+	wantACLs := deviceACLs("device-001")
+	for index, acl := range roleCommand.ACLs {
+		if acl != wantACLs[index] {
+			t.Fatalf("设备 ACL[%d] = %#v, want %#v", index, acl, wantACLs[index])
+		}
 	}
 	clientCommand := transport.calls[3][0]
 	if clientCommand.Username != "device-001" || clientCommand.Password != "one-time-secret" || len(clientCommand.Roles) != 1 || clientCommand.Roles[0].Name != roleCommand.RoleName {
@@ -110,12 +185,12 @@ func TestBootstrapReceiverSetsDenyDefaultsAndSeparateReadRole(t *testing.T) {
 		}
 	}
 	role := transport.calls[2][0]
-	if role.RoleName != receiverRoleName() || len(role.ACLs) != 2 {
+	if role.RoleName != receiverRoleName() || len(role.ACLs) != 5 {
 		t.Fatalf("订阅角色命令 = %#v", role)
 	}
 	for _, acl := range role.ACLs {
-		if acl.Topic != telemetrySubscription || !acl.Allow || acl.Type == "publishClientSend" {
-			t.Fatalf("订阅角色权限不应发布或跨 Topic: %#v", acl)
+		if !acl.Allow || (acl.Topic != telemetrySubscription && acl.Topic != resultSubscription && acl.Topic != "factory/+/command") {
+			t.Fatalf("后端角色 ACL 范围错误: %#v", acl)
 		}
 	}
 	client := transport.calls[4][0]

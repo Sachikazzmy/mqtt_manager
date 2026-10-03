@@ -3,6 +3,7 @@ package telemetry_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -105,6 +106,31 @@ func TestReceiveValidatesPayloadAndPreservesZero(t *testing.T) {
 			want:    telemetry.ErrInvalidMessage,
 		},
 		{
+			name:    "modifiable null",
+			payload: messagePayload("device-001", "modifiable-null", "2026-09-27T11:59:04Z", `{"segment-1":{"value":1,"unit":"V","modifiable":null}}`),
+			want:    telemetry.ErrInvalidMessage,
+		},
+		{
+			name:    "modifiable string",
+			payload: messagePayload("device-001", "modifiable-string", "2026-09-27T11:59:04Z", `{"segment-1":{"value":1,"unit":"V","modifiable":"true"}}`),
+			want:    telemetry.ErrInvalidMessage,
+		},
+		{
+			name:    "modifiable number",
+			payload: messagePayload("device-001", "modifiable-number", "2026-09-27T11:59:04Z", `{"segment-1":{"value":1,"unit":"V","modifiable":1}}`),
+			want:    telemetry.ErrInvalidMessage,
+		},
+		{
+			name:    "duplicate modifiable",
+			payload: messagePayload("device-001", "modifiable-duplicate", "2026-09-27T11:59:04Z", `{"segment-1":{"value":1,"unit":"V","modifiable":true,"modifiable":false}}`),
+			want:    telemetry.ErrInvalidMessage,
+		},
+		{
+			name:    "unknown metric field",
+			payload: messagePayload("device-001", "unknown-metric-field", "2026-09-27T11:59:04Z", `{"segment-1":{"value":1,"unit":"V","other":true}}`),
+			want:    telemetry.ErrInvalidMessage,
+		},
+		{
 			name:    "invalid unit whitespace",
 			payload: messagePayload("device-001", "bad-unit", "2026-09-27T11:59:04Z", `{"segment-1":{"value":1,"unit":" V "}}`),
 			want:    telemetry.ErrInvalidMessage,
@@ -143,6 +169,66 @@ func TestReceiveValidatesPayloadAndPreservesZero(t *testing.T) {
 	}
 	if err := service.Receive(ctx, "device-001", secret, segmentPayload("disabled", "2026-09-27T11:59:06Z", "1")); !errors.Is(err, telemetry.ErrDeviceDisabled) {
 		t.Fatalf("禁用设备错误 = %v", err)
+	}
+}
+
+func TestModifiableCompatibilityHistoryAndPerMetricOrdering(t *testing.T) {
+	_, devices, service, secret, clock := testSetup(t)
+	ctx := context.Background()
+
+	first := messagePayload("device-001", "mod-first", "2026-09-27T10:00:00Z", `{"segment-1":{"value":1,"unit":"V","modifiable":true},"segment-2":{"value":2,"unit":"V","modifiable":false},"segment-3":{"value":3,"unit":"V"}}`)
+	*clock = time.Date(2026, 9, 27, 10, 0, 5, 0, time.UTC)
+	if err := service.Receive(ctx, "device-001", secret, first); err != nil {
+		t.Fatal(err)
+	}
+	newerOldProtocol := messagePayload("device-001", "mod-new-old-protocol", "2026-09-27T11:00:00Z", `{"segment-1":{"value":4,"unit":"V"},"segment-3":{"value":6,"unit":"V","modifiable":true}}`)
+	*clock = time.Date(2026, 9, 27, 11, 0, 5, 0, time.UTC)
+	if err := service.Receive(ctx, "device-001", secret, newerOldProtocol); err != nil {
+		t.Fatal(err)
+	}
+	older := messagePayload("device-001", "mod-older", "2026-09-27T09:00:00Z", `{"segment-1":{"value":9,"unit":"V","modifiable":true},"segment-2":{"value":9,"unit":"V"}}`)
+	*clock = time.Date(2026, 9, 27, 11, 1, 5, 0, time.UTC)
+	if err := service.Receive(ctx, "device-001", secret, older); err != nil {
+		t.Fatal(err)
+	}
+
+	d, err := devices.Get(ctx, "device-001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Latest.Metrics["segment-1"].Modifiable {
+		t.Fatalf("较新的旧协议消息应把修改能力更新为 false: %#v", d.Latest.Metrics["segment-1"])
+	}
+	if d.Latest.Metrics["segment-2"].Modifiable || d.Latest.Metrics["segment-2"].Value != 2 {
+		t.Fatalf("未上报指标应保留全部原状态: %#v", d.Latest.Metrics["segment-2"])
+	}
+	if !d.Latest.Metrics["segment-3"].Modifiable || d.Latest.Metrics["segment-3"].MessageID != "mod-new-old-protocol" {
+		t.Fatalf("逐指标最新消息应更新 modifiable: %#v", d.Latest.Metrics["segment-3"])
+	}
+
+	history, err := service.History(ctx, telemetry.HistoryQuery{DeviceID: "device-001", Limit: 10})
+	if err != nil || len(history) != 3 {
+		t.Fatalf("历史查询 = %#v, %v", history, err)
+	}
+	byID := make(map[string]telemetry.Sample, len(history))
+	for _, sample := range history {
+		byID[sample.MessageID] = sample
+	}
+	firstJSON, err := json.Marshal(byID["mod-first"].Metrics)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(firstJSON, []byte(`"segment-1":{"value":1,"unit":"V","modifiable":true}`)) ||
+		!bytes.Contains(firstJSON, []byte(`"segment-2":{"value":2,"unit":"V","modifiable":false}`)) ||
+		bytes.Contains(firstJSON, []byte(`"segment-3":{"value":3,"unit":"V","modifiable"`)) {
+		t.Fatalf("原始历史必须保留 modifiable 的出现状态: %s", firstJSON)
+	}
+	oldJSON, err := json.Marshal(byID["mod-new-old-protocol"].Metrics["segment-1"])
+	if err != nil || bytes.Contains(oldJSON, []byte(`modifiable`)) {
+		t.Fatalf("旧协议历史不得补写 modifiable: %s, %v", oldJSON, err)
+	}
+	if err := service.Receive(ctx, "device-001", secret, newerOldProtocol); !errors.Is(err, telemetry.ErrDuplicateMessage) {
+		t.Fatalf("重复消息不得改变修改能力或历史: %v", err)
 	}
 }
 
